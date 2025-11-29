@@ -23,3 +23,6 @@ gamma - sync of the microcircuits
 - wyszukaj telefon (tel dzwoni)
 
 ----
+Blink=FP2 up, fp1 up, o2 down o1 down
+BlinkLeft= fp2 
+lookleft=
