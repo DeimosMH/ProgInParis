@@ -16,17 +16,20 @@ import os
 from brainaccess.utils import acquisition
 from brainaccess.core.eeg_manager import EEGManager
 
+# Force TkAgg backend for real-time plotting
 matplotlib.use("TKAgg", force=True)
 
 eeg = acquisition.EEG()
 
-# define electrode locations depending on your device
+# --- CONFIGURATION ---
+# Define electrode locations depending on your device
 halo: dict = {
     0: "Fp1",
     1: "Fp2",
     2: "O1",
     3: "O2",
 }
+
 
 cap: dict = {
  0: "F3",
@@ -39,126 +42,135 @@ cap: dict = {
  7: "O2",
 }
 
-# define device name
+# Define device name
 device_name = "BA HALO 031"
 
+# Recording settings
+RECORDING_DURATION = 1.0  # Cycle duration in seconds
+DEBUG_MODE = True         # If True, save file every cycle.
+PLOT_UPDATE_RATE = 0.02   # Update plot every 50ms (20 FPS) to save CPU
+
+# Ensure data directory exists
+os.makedirs('./data', exist_ok=True)
 
 def sleep_ms(milliseconds):
     """Sleep for the specified number of milliseconds"""
     time.sleep(milliseconds / 1000.0)
 
-# Ensure data directory exists
-os.makedirs('./data', exist_ok=True)
-
 # start EEG acquisition setup
 with EEGManager() as mgr:
     # Setup with 250Hz sampling frequency
-    eeg.setup(mgr, device_name=device_name, cap=halo, sfreq=250)
+    # IMPORTANT: Set zeros_at_start=1 to prevent IndexError when accessing data before packets arrive
+    eeg.setup(mgr, device_name=device_name, cap=halo, sfreq=250, zeros_at_start=1)
 
     # Start acquiring data
     eeg.start_acquisition()
     print("Acquisition started")
-    time.sleep(3)
+    print(f"Cycle duration: {RECORDING_DURATION}s | Debug Mode: {DEBUG_MODE}")
+    time.sleep(1) # Allow device to stabilize
 
+    # Initialize loop variables
     start_time = time.time()
-    annotation = 1
+    last_plot_time = time.time()
+    annotation_counter = 1
     
     # Setup real-time plot
     plt.ion()
     fig, ax = plt.subplots()
     
-    # Define duration for the recording loop (e.g., 120 seconds)
-    recording_duration = 5 
+    # Initial annotation
+    eeg.annotate(str(annotation_counter))
 
     try:
         while True:
-            sleep_ms(250)
-
-            # send annotation to the device
-            print("-> ")
-            eeg.annotate(str(annotation))
-            annotation += 1
-
-            # Retrieve data from the device buffer into the MNE object
-            eeg.get_mne()
+            # 1. Minimal sleep for high-speed loop
+            time.sleep(0.001)
             
-            # Read and prepare part of data to plot/print
-            mne_raw = eeg.data.mne_raw
-            
-            # Get data as numpy array (Channels x Samples)
-            data, _ = mne_raw.get_data(return_times=True)
-            
-            # Calculate number of samples in 250ms
-            sfreq = 250
-            n_samples = int(0.25 * sfreq)
+            current_time = time.time()
+            elapsed = current_time - start_time
 
-            # Ensure we have enough data to slice
-            if data.shape[1] >= n_samples:
-                # print part of data from 250ms ago
-                chunk = data[:, -n_samples:]
+            # 2. Check if Cycle Finished (1 Second)
+            if elapsed >= RECORDING_DURATION:
+                # --- END OF CYCLE ---
                 
-                # Print average voltage of the first channel
-                print(f"Data shape: {chunk.shape} | Ch0 Mean (last 250ms): {np.mean(chunk[0]):.2e}")
-
-                # update plot part of data from 250ms ago
-                ax.clear()
-                
-                # Plot channels with an offset for visibility
-                for i in range(chunk.shape[0] - 1):
-                    # Center the data and add offset
-                    offset = i * 0.0001 
+                if DEBUG_MODE:
+                    # Fetch final data for this cycle
+                    eeg.get_mne()
                     
-                    # Get label from the dictionary if available, otherwise generic ID
-                    label_name = halo.get(i, f"Ch{i}")
-                    
-                    ax.plot(chunk[i] - np.mean(chunk[i]) + offset, label=label_name)
-                
-                ax.set_title(f"Live Data (Cycle Time: {int(time.time() - start_time)}s)")
-                ax.set_xlabel("Samples (last 250ms)")
-                
-                # Add Legend based on dictionary data
-                ax.legend(loc='upper right', fontsize='small', framealpha=0.5)
-                
-                plt.draw()
-                plt.pause(0.001)
-
-                # Check if recording duration has passed to finish cycle and reset
-                if time.time() - start_time > recording_duration:
-                    print(f"\n--- Cycle finished ({recording_duration}s) ---")
-
-                    ## Plot all data (Snapshot) ##
-                    full_data, full_times = mne_raw.get_data(return_times=True)
-                    ax.clear()
-                    for i in range(full_data.shape[0]):
-                        offset = i * 0.0001
-                        label_name = halo.get(i, f"Ch{i}")
-                        ax.plot(full_times, full_data[i] - np.mean(full_data[i]) + offset, label=label_name)
-                    
-                    ax.set_title(f"Full Cycle Data saved at {time.strftime('%H:%M:%S')}")
-                    ax.set_xlabel("Time (s)")
-                    ax.legend(loc='upper right', fontsize='small')
-                    plt.draw()
-                    plt.pause(1.0) 
-
-                    ## Save EEG data ##
+                    # Generate filename
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    filename = f'./data/{timestamp}-raw.fif'
+                    filename = f'./data/{timestamp}-cycle_{annotation_counter}.fif'
+                    
+                    # Save data
                     eeg.data.save(filename)
-                    print(f"Data saved to: {filename}")
+                    print(f"[{timestamp}] Saved cycle {annotation_counter} ({elapsed:.3f}s)")
+                
+                # --- RESET BUFFERS ---
+                # We lock to ensure thread safety while resetting the buffer
+                with eeg.lock:
+                    n_chans = len(eeg.info['ch_names'])
+                    zeros_at_start = eeg.data.zeros_at_start
+                    
+                    # Clear raw data list, re-initializing with the safe zero-padding
+                    eeg.data.data = [np.zeros((n_chans, zeros_at_start))]
+                    
+                    # Clear annotations
+                    eeg.data.annotations = {}
+                    
+                    # Delete MNE object to force regeneration next cycle
+                    if hasattr(eeg.data, 'mne_raw'):
+                        del eeg.data.mne_raw
+                
+                # Update Cycle Variables
+                start_time = time.time()
+                annotation_counter += 1
+                
+                # Send annotation for the NEW cycle
+                # print("->")
+                eeg.annotate(str(annotation_counter))
+                continue # Skip the rest of the loop to start fresh immediately
 
-                    ## Clean data and retrieve again ##
-                    print("Resetting internal buffers...")
-                    with eeg.lock:
-                        n_chans = len(eeg.info['ch_names'])
-                        zeros_at_start = eeg.data.zeros_at_start
-                        eeg.data.data = [np.zeros((n_chans, zeros_at_start))]
-                        eeg.data.annotations = {}
-                        if hasattr(eeg.data, 'mne_raw'):
-                            del eeg.data.mne_raw
-
-                    start_time = time.time()
-                    annotation = 1
-                    print("Buffer cleared. Starting new cycle.\n")
+            # 3. Visualization (Throttled)
+            if current_time - last_plot_time > PLOT_UPDATE_RATE:
+                # Wrap visualization in try/except to prevent loop crash on transient data states
+                try:
+                    eeg.get_mne()
+                    
+                    if hasattr(eeg.data, 'mne_raw'):
+                        mne_raw = eeg.data.mne_raw
+                        data, _ = mne_raw.get_data(return_times=True)
+                        
+                        # Use last 250ms for visualization
+                        sfreq = 250
+                        window_samples = int(0.25 * sfreq) 
+                        
+                        # Only plot if we have more data than just the initialization zeros
+                        if data.shape[1] > 1: 
+                            
+                            start_idx = -window_samples if data.shape[1] > window_samples else 0
+                            chunk = data[:, start_idx:]
+                            
+                            ax.clear()
+                            
+                            # Plot channels
+                            for i in range(chunk.shape[0]):
+                                offset = i * 0.0001 
+                                label_name = halo.get(i, f"Ch{i}")
+                                
+                                if chunk.shape[1] > 0:
+                                    ax.plot(chunk[i] - np.mean(chunk[i]) + offset, label=label_name)
+                            
+                            ax.set_title(f"Live Monitor (Cycle: {annotation_counter} | {elapsed:.2f}s)")
+                            ax.set_xlabel("Samples")
+                            ax.legend(loc='upper right', fontsize='small', framealpha=0.5)
+                            
+                            plt.draw()
+                            plt.pause(0.001)
+                except Exception as e:
+                    # Ignore visualization errors to keep acquisition running
+                    pass
+                
+                last_plot_time = time.time()
 
     except KeyboardInterrupt:
         print("\nManually interrupted.")
