@@ -10,7 +10,8 @@ Change Bluetooth device name
 import matplotlib.pyplot as plt
 import matplotlib
 import time
-import numpy as np  # Added for array manipulation
+import numpy as np
+import os  
 
 from brainaccess.utils import acquisition
 from brainaccess.core.eeg_manager import EEGManager
@@ -46,6 +47,9 @@ def sleep_ms(milliseconds):
     """Sleep for the specified number of milliseconds"""
     time.sleep(milliseconds / 1000.0)
 
+# Ensure data directory exists
+os.makedirs('./data', exist_ok=True)
+
 # start EEG acquisition setup
 with EEGManager() as mgr:
     # Setup with 250Hz sampling frequency
@@ -63,104 +67,109 @@ with EEGManager() as mgr:
     plt.ion()
     fig, ax = plt.subplots()
     
-    # Define duration for the recording loop (e.g., 20 seconds)
-    recording_duration = 120 
+    # Define duration for the recording loop (e.g., 120 seconds)
+    recording_duration = 5
 
-    while True:
-        # time.sleep(1)
-        sleep_ms(250)
+    try:
+        while True:
+            sleep_ms(250)
 
-        # send annotation to the device
-        # print(f"Sending annotation {annotation} to the device")
-        
-        print("-> ")
-        eeg.annotate(str(annotation))
-        annotation += 1
+            # send annotation to the device
+            print("-> ")
+            eeg.annotate(str(annotation))
+            annotation += 1
 
-        # Retrieve data from the device buffer into the MNE object
-        # Note: calling get_mne() without arguments retrieves the entire recording history.
-        eeg.get_mne()
-        
-        # Read and prepare part of data to plot/print
-        mne_raw = eeg.data.mne_raw
-        
-        # Get data as numpy array (Channels x Samples)
-        data, _ = mne_raw.get_data(return_times=True)
-        
-        # Calculate number of samples in 250ms (0.25s * 250Hz = ~62 samples)
-        sfreq = 250
-        n_samples = int(0.25 * sfreq)
-
-        # Ensure we have enough data to slice
-        if data.shape[1] >= n_samples:
-            # print part of data from 250ms ago
-            chunk = data[:, -n_samples:]
+            # Retrieve data from the device buffer into the MNE object
+            # Note: calling get_mne() without arguments retrieves the entire recording history.
+            eeg.get_mne()
             
-            # Print average voltage of the first channel in the last 250ms
-            # (Multiplied by 1e6 to show meaningful microvolt-scale numbers if raw is in Volts)
-            print(f"Data shape: {chunk.shape} | Ch0 Mean (last 250ms): {np.mean(chunk[0]):.2e}")
-
-            # update plot part of data from 250ms ago
-            ax.clear()
+            # Read and prepare part of data to plot/print
+            mne_raw = eeg.data.mne_raw
             
-            # Plot channels with an offset for visibility
-            for i in range(chunk.shape[0]):
-                # Center the data and add offset
-                offset = i * 0.0001 
-                ax.plot(chunk[i] - np.mean(chunk[i]) + offset, label=f'Ch{i}')
+            # Get data as numpy array (Channels x Samples)
+            data, _ = mne_raw.get_data(return_times=True)
             
-            ax.set_title("Last 250ms Data")
-            ax.set_xlabel("Samples")
-            plt.draw()
-            plt.pause(0.001)
+            # Calculate number of samples in 250ms (0.25s * 250Hz = ~62 samples)
+            sfreq = 250
+            n_samples = int(0.25 * sfreq)
 
-            # Check if recording duration has passed to exit loop
-            if time.time() - start_time > recording_duration:
-
-                start_time = time.time()
-                annotation = 1
-
-
-                ## Plot current data ##
-
-                # Access MNE Raw object
-                mne_raw = eeg.data.mne_raw
-                print(f"MNE Raw object: {mne_raw}")
-
-                # Access data as NumPy arrays
-                data, times = mne_raw.get_data(return_times=True)
-                print(f"Data shape: {data.shape}")
-
-                # save EEG data to MNE fif format
-                eeg.data.save(f'./data/{time.strftime("%Y%m%d_%H%M")}-raw.fif')
-
+            # Ensure we have enough data to slice
+            if data.shape[1] >= n_samples:
+                # print part of data from 250ms ago
+                chunk = data[:, -n_samples:]
                 
-                ## Plot all data
+                # Print average voltage of the first channel in the last 250ms
+                print(f"Data shape: {chunk.shape} | Ch0 Mean (last 250ms): {np.mean(chunk[0]):.2e}")
 
+                # update plot part of data from 250ms ago
+                ax.clear()
+                
+                # Plot channels with an offset for visibility
+                for i in range(chunk.shape[0]):
+                    # Center the data and add offset
+                    offset = i * 0.0001 
+                    ax.plot(chunk[i] - np.mean(chunk[i]) + offset, label=f'Ch{i}')
+                
+                ax.set_title(f"Live Data (Cycle Time: {int(time.time() - start_time)}s)")
+                ax.set_xlabel("Samples (last 250ms)")
+                plt.draw()
+                plt.pause(0.001)
 
+                # Check if recording duration has passed to finish cycle and reset
+                if time.time() - start_time > recording_duration:
+                    print(f"\n--- Cycle finished ({recording_duration}s) ---")
 
-                ## Clean data and retrieve again
+                    ## Plot all data (Snapshot) ##
+                    # We use the existing ax to show the full trace briefly
+                    full_data, full_times = mne_raw.get_data(return_times=True)
+                    ax.clear()
+                    for i in range(full_data.shape[0]):
+                        offset = i * 0.0001
+                        # Downsample slightly for faster plotting if needed, or plot all
+                        ax.plot(full_times, full_data[i] - np.mean(full_data[i]) + offset)
+                    ax.set_title(f"Full Cycle Data saved at {time.strftime('%H:%M:%S')}")
+                    ax.set_xlabel("Time (s)")
+                    plt.draw()
+                    plt.pause(1.0) # Pause so user can see the full plot
 
+                    ## Save EEG data ##
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    filename = f'./data/{timestamp}-raw.fif'
+                    eeg.data.save(filename)
+                    print(f"Data saved to: {filename}")
 
-    print("Error")
-    # # Close the realtime plot
-    # plt.close(fig)
-    # time.sleep(2)
+                    ## Clean data and retrieve again ##
+                    print("Resetting internal buffers...")
+                    
+                    # We must lock the thread to safely clear the buffer being filled by the callback
+                    with eeg.lock:
+                        # Re-initialize the data storage list (List of arrays)
+                        # We use the initial zeros structure defined in acquisition.py
+                        n_chans = len(eeg.info['ch_names'])
+                        zeros_at_start = eeg.data.zeros_at_start
+                        eeg.data.data = [np.zeros((n_chans, zeros_at_start))]
+                        
+                        # Clear annotations
+                        eeg.data.annotations = {}
+                        
+                        # Remove the cached MNE object so it regenerates next time
+                        if hasattr(eeg.data, 'mne_raw'):
+                            del eeg.data.mne_raw
 
-    # # get all eeg data and stop acquisition
-    # eeg.get_mne()
-    eeg.stop_acquisition()
-    mgr.disconnect()
+                    # Reset timers for next cycle
+                    start_time = time.time()
+                    annotation = 1
+                    print("Buffer cleared. Starting new cycle.\n")
 
+    except KeyboardInterrupt:
+        print("\nManually interrupted.")
+    finally:
+        # Final cleanup
+        print("Stopping acquisition...")
+        eeg.stop_acquisition()
+        mgr.disconnect()
+        plt.close(fig)
+        print("Done.")
 
-# # Close brainaccess library
+# Code below is unreachable if loop is infinite, but kept for reference
 # eeg.close()
-
-# # conversion to microvolts
-# mne_raw.apply_function(lambda x: x*10**-6)
-
-# # Show recorded data (post-processing plot)
-# # Turn off interactive mode so plt.show() blocks
-# plt.ioff() 
-# mne_raw.filter(1, 40).plot(scalings="auto", verbose=False)
-# plt.show()
