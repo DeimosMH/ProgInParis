@@ -1,5 +1,6 @@
 from pynput.mouse import Controller as dick,Button
 from pynput.keyboard import Controller,Key
+from event_bus import event_bus 
 import time
 
 class BCIProcessor:
@@ -44,6 +45,9 @@ class BCIProcessor:
     @staticmethod
     def lookDown():
         print("BCIProcessor: Executing Look Down Action.")
+    
 
-time.sleep(3)
-BCIProcessor.blinkLeft()
+    @staticmethod
+    def signalData(data):
+        event_bus.dataforchart.emit(data)
+        

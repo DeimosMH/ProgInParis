@@ -7,6 +7,7 @@ class Messenger:
     """
     def __init__(self):
         # Stores the current state of detected actions/events
+
         self.actions = {} 
         print('Message created')
         # Step 2: Create a dispatch map using the imported BCIProcessor methods
@@ -49,4 +50,7 @@ class Messenger:
         # Reset the state for the next cycle
         self.actions.clear() 
         print(f"--- Finished processing {processed_count} action(s) ---\n")
+
+    def sendChartData(self, data :list()):
+        BCIProcessor.signalData(data)
 
