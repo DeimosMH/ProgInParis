@@ -1,12 +1,3 @@
-""" EEG measurement example
-
-Example how to get measurements and
-save to fif format
-using acquisition class from brainaccess.utils
-
-Change Bluetooth device name
-"""
-
 import matplotlib.pyplot as plt
 import matplotlib
 import time
@@ -16,221 +7,173 @@ from scipy.signal import savgol_filter, butter, filtfilt
 
 from brainaccess.utils import acquisition
 from brainaccess.core.eeg_manager import EEGManager
-
-# Force TkAgg backend for real-time plotting
-matplotlib.use("TKAgg", force=True)
-
-eeg = acquisition.EEG()
+import brainaccess.core.eeg_channel as eeg_channel
 
 # --- CONFIGURATION ---
 
-# 1. Device Settings
-device_name = "BA HALO 031"
+# 1. Device & BCI Settings
+DEVICE_NAME = "BA HALO 031"
+CYCLE_DURATION_S = 1.0  # How often to process data and make a decision (in seconds)
 
-# Define electrode locations depending on your device
-halo: dict = {
+# 2. Channel Mapping (Corrected: 'Sample' channel removed)
+# The 'Sample' channel is handled automatically by the library.
+# Defining it here causes the montage error.
+HALO_CAP: dict = {
     0: "Fp1",
     1: "Fp2",
     2: "O1",
     3: "O2",
 }
 
-
-cap: dict = {
- 0: "F3",
- 1: "F4",
- 2: "C3",
- 3: "C4",
- 4: "P3",
- 5: "P4",
- 6: "O1",
- 7: "O2",
-}
-
-# 2. Recording Settings
-RECORDING_DURATION = 1.0  # Cycle duration in seconds
-DEBUG_MODE = True         # Save .fif file every cycle
-PLOT_UPDATE_RATE = 0.05   # Update plot every 50ms (20 FPS)
-
 # 3. Signal Processing / Denoising Options
-# Options: "raw", "moving_average", "savgol", "bandpass"
 PROCESSING_CONFIG = {
-    "method": "savgol",       # Active method
-    "save_filtered": False,   # If True, saves filtered data. If False, saves RAW data (Recommended: False)
-    
-    # Settings for specific methods:
-    "mov_avg_window": 5,      # Window size for Moving Average (samples)
-    "savgol_window": 11,      # Window length for Savitzky-Golay (must be odd)
-    "savgol_poly": 3,         # Polynomial order for Savitzky-Golay
-    "bp_low": 1,              # Bandpass low cut (Hz)
-    "bp_high": 30             # Bandpass high cut (Hz)
+    "method": "savgol",
+    "savgol_window": 11,
+    "savgol_poly": 3,
+    "bp_low": 1,
+    "bp_high": 30
 }
 
-# Ensure data directory exists
-os.makedirs('./data', exist_ok=True)
+# 4. Visualization Settings
+PLOT_ENABLED = True
+PLOT_UPDATE_RATE_S = 0.1 # Update plot 10 times per second
+PLOT_WINDOW_S = 2.0       # Show the last 2 seconds of data in the plot
 
-def sleep_ms(milliseconds):
-    """Sleep for the specified number of milliseconds"""
-    time.sleep(milliseconds / 1000.0)
+# --- END OF CONFIGURATION ---
 
-def apply_signal_processing(data_chunk, sfreq=250):
-    """
-    Applies the configured smoothing/denoising to a numpy array (Channels x Samples).
-    """
+def apply_signal_processing(data, sfreq=250):
+    """Applies configured denoising to a numpy array (Channels x Samples)."""
     method = PROCESSING_CONFIG["method"]
-    
-    # Return immediately if raw or empty
-    if method == "raw" or data_chunk.shape[1] == 0:
-        return data_chunk
-
+    if method == "raw" or data.shape[1] == 0:
+        return data
     try:
-        if method == "moving_average":
-            # Simple boxcar smoothing
-            window = PROCESSING_CONFIG["mov_avg_window"]
-            kernel = np.ones(window) / window
-            # Convolve along the last axis (time)
-            # mode='same' keeps the output size equal to input
-            return np.apply_along_axis(lambda m: np.convolve(m, kernel, mode='same'), axis=1, arr=data_chunk)
-
-        elif method == "savgol":
-            # Savitzky-Golay filter (smooths while preserving peak features)
-            window = PROCESSING_CONFIG["savgol_window"]
-            poly = PROCESSING_CONFIG["savgol_poly"]
-            # Check if data is long enough for the window
-            if data_chunk.shape[1] > window:
-                return savgol_filter(data_chunk, window, poly, axis=1)
-            else:
-                return data_chunk
-
+        if method == "savgol":
+            window, poly = PROCESSING_CONFIG["savgol_window"], PROCESSING_CONFIG["savgol_poly"]
+            if data.shape[1] > window:
+                return savgol_filter(data, window, poly, axis=1)
         elif method == "bandpass":
-            # Butterworth Bandpass Filter
-            # Note: filtering short chunks (like 250ms) creates edge artifacts.
-            # This is best used on the full 1-second epoch, not the small live chunks.
-            low = PROCESSING_CONFIG["bp_low"]
-            high = PROCESSING_CONFIG["bp_high"]
-            nyquist = 0.5 * sfreq
+            low, high, nyquist = PROCESSING_CONFIG["bp_low"], PROCESSING_CONFIG["bp_high"], 0.5 * sfreq
             b, a = butter(2, [low / nyquist, high / nyquist], btype='band')
-            # filtfilt applies filter forward and backward (zero phase)
-            # We use a try/except because filtfilt requires a minimum signal length
-            if data_chunk.shape[1] > 15:
-                return filtfilt(b, a, data_chunk, axis=1)
-            else:
-                return data_chunk
-
+            if data.shape[1] > 15: # filtfilt requires a minimum data length
+                return filtfilt(b, a, data, axis=1)
     except Exception as e:
         print(f"Filter error ({method}): {e}")
-        return data_chunk
+    return data
+
+def detect_mouse_click(eeg_data, channel_names):
+    """
+    Placeholder for your pattern recognition logic.
     
-    return data_chunk
-
-# start EEG acquisition setup
-with EEGManager() as mgr:
-    # IMPORTANT: Set zeros_at_start=1 to prevent IndexError on high-speed loops
-    eeg.setup(mgr, device_name=device_name, cap=halo, sfreq=250, zeros_at_start=1)
-
-    eeg.start_acquisition()
-    print("Acquisition started")
-    print(f"Cycle: {RECORDING_DURATION}s | Filter: {PROCESSING_CONFIG['method']}")
-    time.sleep(1) 
-
-    start_time = time.time()
-    last_plot_time = time.time()
-    annotation_counter = 1
+    Args:
+        eeg_data (np.ndarray): A (channels x samples) numpy array of processed EEG data.
+        channel_names (list): A list of channel names corresponding to the rows in eeg_data.
     
-    plt.ion()
-    fig, ax = plt.subplots()
-    eeg.annotate(str(annotation_counter))
-
+    Returns:
+        str: "LEFT", "RIGHT", or "NONE"
+    """
+    # --- YOUR LOGIC GOES HERE ---
+    # Example: Find the index for the 'Fp1' channel
     try:
-        while True:
-            # 1. Minimal sleep for high-speed loop
-            time.sleep(0.001)
-            
-            current_time = time.time()
-            elapsed = current_time - start_time
+        fp1_index = channel_names.index('Fp1')
+        fp1_data = eeg_data[fp1_index]
+        
+        # This is a placeholder. You will replace this with your actual
+        # slope detection or pattern recognition algorithm.
+        if np.mean(fp1_data) > 1e-5: # Example threshold
+             return "LEFT CLICK"
+             
+    except ValueError:
+        pass # Channel not found
 
-            # 2. Check if Cycle Finished
-            if elapsed >= RECORDING_DURATION:
-                if DEBUG_MODE:
-                    # Fetch final data for this cycle
-                    eeg.get_mne()
-                    
-                    # Optional: Apply filter to the SAVED data
-                    # (Usually EEG is saved raw, but user configuration allows override)
-                    if PROCESSING_CONFIG["save_filtered"]:
-                        # We must extract data, filter, and put it back (complex for MNE object)
-                        # Or simpler: Use MNE's built-in filter method
-                        if PROCESSING_CONFIG["method"] == "bandpass":
-                             eeg.data.mne_raw.filter(PROCESSING_CONFIG["bp_low"], 
-                                                     PROCESSING_CONFIG["bp_high"], 
-                                                     verbose=False)
-                    
-                    timestamp = time.strftime("%Y%m%d_%H%M%S")
-                    filename = f'./data/{timestamp}-cycle_{annotation_counter}.fif'
-                    eeg.data.save(filename)
-                    print(f"[{timestamp}] Saved cycle {annotation_counter} ({elapsed:.3f}s)")
+    return "NONE"
+
+def main():
+    """Main function to run the real-time BCI loop."""
+    # This must be at the top of the function
+    global PLOT_ENABLED
+    
+    eeg = acquisition.EEG()
+    
+    if PLOT_ENABLED:
+        try:
+            matplotlib.use("TKAgg", force=True)
+            plt.ion()
+            fig, ax = plt.subplots(figsize=(12, 6))
+        except ImportError:
+            print("Warning: TkAgg backend not available. Disabling real-time plotting.")
+            PLOT_ENABLED = False
+
+    with EEGManager() as mgr:
+        print(f"Setting up device: {DEVICE_NAME}...")
+        # Note: cap now correctly uses the modified HALO_CAP dictionary
+        eeg.setup(mgr, device_name=DEVICE_NAME, cap=HALO_CAP, sfreq=250, zeros_at_start=1)
+        eeg.start_acquisition()
+        print("Acquisition started. Starting BCI loop...")
+        time.sleep(1)
+
+        last_plot_time = time.time()
+        
+        try:
+            while True:
+                # 1. Get the most recent chunk of data
+                mne_raw = eeg.get_mne(tim=CYCLE_DURATION_S)
+                if not mne_raw or mne_raw.get_data().shape[1] == 0:
+                    time.sleep(0.1)
+                    continue
+
+                # 2. Process the data
+                raw_data, _ = mne_raw.get_data(return_times=True)
+                clean_data = apply_signal_processing(raw_data.copy(), eeg.sfreq)
                 
-                # --- RESET BUFFERS ---
-                with eeg.lock:
-                    n_chans = len(eeg.info['ch_names'])
-                    zeros_at_start = eeg.data.zeros_at_start
-                    eeg.data.data = [np.zeros((n_chans, zeros_at_start))]
-                    eeg.data.annotations = {}
-                    if hasattr(eeg.data, 'mne_raw'):
-                        del eeg.data.mne_raw
-                
-                start_time = time.time()
-                annotation_counter += 1
-                eeg.annotate(str(annotation_counter))
-                continue
+                # 3. Make a decision
+                decision = detect_mouse_click(clean_data, mne_raw.ch_names)
+                print(f"Cycle decision: {decision}")
 
-            # 3. Visualization (Throttled)
-            if current_time - last_plot_time > PLOT_UPDATE_RATE:
-                try:
-                    eeg.get_mne()
-                    
-                    if hasattr(eeg.data, 'mne_raw'):
-                        mne_raw = eeg.data.mne_raw
-                        data, _ = mne_raw.get_data(return_times=True)
-                        
-                        # Visualization Window (last 250ms)
-                        sfreq = 250
-                        window_samples = int(0.25 * sfreq) 
-                        
-                        if data.shape[1] > 1: 
-                            start_idx = -window_samples if data.shape[1] > window_samples else 0
-                            raw_chunk = data[:, start_idx:]
-                            
-                            # --- APPLY DENOISING FOR PLOT ---
-                            # This does not affect the MNE object/saved data (unless configured above)
-                            clean_chunk = apply_signal_processing(raw_chunk, sfreq)
+                # 4. Update plot (throttled)
+                if PLOT_ENABLED and (time.time() - last_plot_time > PLOT_UPDATE_RATE_S):
+                    update_plot(eeg, ax)
+                    last_plot_time = time.time()
 
-                            ax.clear()
-                            
-                            for i in range(clean_chunk.shape[0]):
-                                offset = i * 0.0001 
-                                label_name = halo.get(i, f"Ch{i}")
-                                
-                                # Demean and plot
-                                if clean_chunk.shape[1] > 0:
-                                    signal = clean_chunk[i] - np.mean(clean_chunk[i]) + offset
-                                    ax.plot(signal, label=label_name)
-                            
-                            ax.set_title(f"Live ({PROCESSING_CONFIG['method']}) | Cycle: {annotation_counter}")
-                            ax.legend(loc='upper right', fontsize='x-small', framealpha=0.5)
-                            
-                            plt.draw()
-                            plt.pause(0.001)
-                except Exception as e:
-                    pass
-                
-                last_plot_time = time.time()
+                # 5. Wait for the next cycle
+                time.sleep(CYCLE_DURATION_S)
 
-    except KeyboardInterrupt:
-        print("\nManually interrupted.")
-    finally:
-        print("Stopping acquisition...")
-        eeg.stop_acquisition()
-        mgr.disconnect()
-        plt.close(fig)
-        print("Done.")
+        except KeyboardInterrupt:
+            print("\nManually interrupted.")
+        finally:
+            print("Stopping acquisition...")
+            eeg.stop_acquisition()
+            mgr.disconnect()
+            if PLOT_ENABLED:
+                plt.ioff()
+                plt.close()
+            print("Done.")
+
+def update_plot(eeg, ax):
+    """Fetches recent data and updates the matplotlib plot."""
+    try:
+        # Get a slightly larger window for plotting to see context
+        mne_raw_plot = eeg.get_mne(tim=PLOT_WINDOW_S)
+        if mne_raw_plot:
+            data, _ = mne_raw_plot.get_data(return_times=True)
+            if data.shape[1] > 1:
+                clean_data = apply_signal_processing(data.copy(), eeg.sfreq)
+                ax.clear()
+                for i, ch_name in enumerate(mne_raw_plot.ch_names):
+                    offset = i * 100 
+                    # Convert to microvolts for plotting
+                    signal = (clean_data[i] * 1e6) - np.mean(clean_data[i] * 1e6) + offset
+                    ax.plot(signal, label=ch_name)
+                ax.set_title(f"Live EEG ({PROCESSING_CONFIG['method']})")
+                ax.set_ylabel("Amplitude (uV) + Offset")
+                ax.legend(loc='upper right', fontsize='small')
+                plt.draw()
+                plt.pause(0.001)
+    except Exception as e:
+        # This can happen if the plot window is closed manually
+        print(f"Plotting error: {e}")
+        global PLOT_ENABLED
+        PLOT_ENABLED = False
+
+
+if __name__ == "__main__":
+    main()
