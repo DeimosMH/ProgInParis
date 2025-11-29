@@ -1,0 +1,3 @@
+brainaccess
+mne
+PyQt5

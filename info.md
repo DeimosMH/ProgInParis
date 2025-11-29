@@ -26,7 +26,7 @@ sudo pacman -Syu
 sudo pacman -S python python-pip
 python -m venv ./venv
 source ./venv/bin/activate
-python --version  # Should show Python 3.13.x
+ # Should show Python 3.13.x
 
 yay -S python313
 python3.13 -m venv ./venv
@@ -37,6 +37,8 @@ pyenv install 3.13.0
 pyenv local 3.13.0
 python -m venv ./venv
 source ./venv/bin/activate
+
+sudo pacman -S python-pyqt5
 ```
 
 ### Debian
@@ -80,8 +82,4 @@ python -m venv ./venv
 source ./venv/bin/activate
 ```
 
-## Use venv
-
-```sh
-source "$VENV_DIR/bin/activate"
-```
+## Dependencies
