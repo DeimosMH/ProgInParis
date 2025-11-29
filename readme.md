@@ -14,3 +14,12 @@ beta - blocking, concentration
 gamma - sync of the microcircuits
 
 - signal are noise - think about the filtering 
+
+----
+- osoby nietechniczne, starsze
+- nastepna/poprzednia muzyka (odtwarzacz)
+- zadzwon pomoc | /jasiu/kacper...
+- odbierz telefon 
+- wyszukaj telefon (tel dzwoni)
+
+----
