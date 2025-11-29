@@ -38,11 +38,11 @@ cap: dict = {
 }
 
 # define device name
-device_name = "BA MINI 047"
+device_name = "BA HALO 031"
 
 # start EEG acquisition setup
 with EEGManager() as mgr:
-    eeg.setup(mgr, device_name=device_name, cap=cap, sfreq=250)
+    eeg.setup(mgr, device_name=device_name, cap=halo, sfreq=250)
 
     # Start acquiring data
     eeg.start_acquisition()

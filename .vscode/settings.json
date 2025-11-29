@@ -1,0 +1,5 @@
+{
+    "python.analysis.extraPaths": [
+        "./brain_access/hotb_starter_code/BrainAccessSDK-linux/python_api"
+    ]
+}
