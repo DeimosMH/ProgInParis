@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 import time
 import numpy as np
-import os  
+import os
 
 from brainaccess.utils import acquisition
 from brainaccess.core.eeg_manager import EEGManager
@@ -68,7 +68,7 @@ with EEGManager() as mgr:
     fig, ax = plt.subplots()
     
     # Define duration for the recording loop (e.g., 120 seconds)
-    recording_duration = 5
+    recording_duration = 5 
 
     try:
         while True:
@@ -80,7 +80,6 @@ with EEGManager() as mgr:
             annotation += 1
 
             # Retrieve data from the device buffer into the MNE object
-            # Note: calling get_mne() without arguments retrieves the entire recording history.
             eeg.get_mne()
             
             # Read and prepare part of data to plot/print
@@ -89,7 +88,7 @@ with EEGManager() as mgr:
             # Get data as numpy array (Channels x Samples)
             data, _ = mne_raw.get_data(return_times=True)
             
-            # Calculate number of samples in 250ms (0.25s * 250Hz = ~62 samples)
+            # Calculate number of samples in 250ms
             sfreq = 250
             n_samples = int(0.25 * sfreq)
 
@@ -98,20 +97,28 @@ with EEGManager() as mgr:
                 # print part of data from 250ms ago
                 chunk = data[:, -n_samples:]
                 
-                # Print average voltage of the first channel in the last 250ms
+                # Print average voltage of the first channel
                 print(f"Data shape: {chunk.shape} | Ch0 Mean (last 250ms): {np.mean(chunk[0]):.2e}")
 
                 # update plot part of data from 250ms ago
                 ax.clear()
                 
                 # Plot channels with an offset for visibility
-                for i in range(chunk.shape[0]):
+                for i in range(chunk.shape[0] - 1):
                     # Center the data and add offset
                     offset = i * 0.0001 
-                    ax.plot(chunk[i] - np.mean(chunk[i]) + offset, label=f'Ch{i}')
+                    
+                    # Get label from the dictionary if available, otherwise generic ID
+                    label_name = halo.get(i, f"Ch{i}")
+                    
+                    ax.plot(chunk[i] - np.mean(chunk[i]) + offset, label=label_name)
                 
                 ax.set_title(f"Live Data (Cycle Time: {int(time.time() - start_time)}s)")
                 ax.set_xlabel("Samples (last 250ms)")
+                
+                # Add Legend based on dictionary data
+                ax.legend(loc='upper right', fontsize='small', framealpha=0.5)
+                
                 plt.draw()
                 plt.pause(0.001)
 
@@ -120,17 +127,18 @@ with EEGManager() as mgr:
                     print(f"\n--- Cycle finished ({recording_duration}s) ---")
 
                     ## Plot all data (Snapshot) ##
-                    # We use the existing ax to show the full trace briefly
                     full_data, full_times = mne_raw.get_data(return_times=True)
                     ax.clear()
                     for i in range(full_data.shape[0]):
                         offset = i * 0.0001
-                        # Downsample slightly for faster plotting if needed, or plot all
-                        ax.plot(full_times, full_data[i] - np.mean(full_data[i]) + offset)
+                        label_name = halo.get(i, f"Ch{i}")
+                        ax.plot(full_times, full_data[i] - np.mean(full_data[i]) + offset, label=label_name)
+                    
                     ax.set_title(f"Full Cycle Data saved at {time.strftime('%H:%M:%S')}")
                     ax.set_xlabel("Time (s)")
+                    ax.legend(loc='upper right', fontsize='small')
                     plt.draw()
-                    plt.pause(1.0) # Pause so user can see the full plot
+                    plt.pause(1.0) 
 
                     ## Save EEG data ##
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -140,23 +148,14 @@ with EEGManager() as mgr:
 
                     ## Clean data and retrieve again ##
                     print("Resetting internal buffers...")
-                    
-                    # We must lock the thread to safely clear the buffer being filled by the callback
                     with eeg.lock:
-                        # Re-initialize the data storage list (List of arrays)
-                        # We use the initial zeros structure defined in acquisition.py
                         n_chans = len(eeg.info['ch_names'])
                         zeros_at_start = eeg.data.zeros_at_start
                         eeg.data.data = [np.zeros((n_chans, zeros_at_start))]
-                        
-                        # Clear annotations
                         eeg.data.annotations = {}
-                        
-                        # Remove the cached MNE object so it regenerates next time
                         if hasattr(eeg.data, 'mne_raw'):
                             del eeg.data.mne_raw
 
-                    # Reset timers for next cycle
                     start_time = time.time()
                     annotation = 1
                     print("Buffer cleared. Starting new cycle.\n")
@@ -164,12 +163,8 @@ with EEGManager() as mgr:
     except KeyboardInterrupt:
         print("\nManually interrupted.")
     finally:
-        # Final cleanup
         print("Stopping acquisition...")
         eeg.stop_acquisition()
         mgr.disconnect()
         plt.close(fig)
         print("Done.")
-
-# Code below is unreachable if loop is infinite, but kept for reference
-# eeg.close()
