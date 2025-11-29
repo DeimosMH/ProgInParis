@@ -64,15 +64,11 @@ with EEGManager() as mgr:
     fig, ax = plt.subplots()
     
     # Define duration for the recording loop (e.g., 20 seconds)
-    recording_duration = 20 
+    recording_duration = 120 
 
     while True:
         # time.sleep(1)
         sleep_ms(250)
-
-        # # Check if recording duration has passed to exit loop
-        # if time.time() - start_time > recording_duration:
-        #     break
 
         # send annotation to the device
         # print(f"Sending annotation {annotation} to the device")
@@ -118,35 +114,53 @@ with EEGManager() as mgr:
             plt.draw()
             plt.pause(0.001)
 
-    print("Preparing to plot data")
-    # Close the realtime plot
-    plt.close(fig)
-    time.sleep(2)
+            # Check if recording duration has passed to exit loop
+            if time.time() - start_time > recording_duration:
 
-    # get all eeg data and stop acquisition
-    eeg.get_mne()
+                start_time = time.time()
+                annotation = 1
+
+
+                ## Plot current data ##
+
+                # Access MNE Raw object
+                mne_raw = eeg.data.mne_raw
+                print(f"MNE Raw object: {mne_raw}")
+
+                # Access data as NumPy arrays
+                data, times = mne_raw.get_data(return_times=True)
+                print(f"Data shape: {data.shape}")
+
+                # save EEG data to MNE fif format
+                eeg.data.save(f'./data/{time.strftime("%Y%m%d_%H%M")}-raw.fif')
+
+                
+                ## Plot all data
+
+
+
+                ## Clean data and retrieve again
+
+
+    print("Error")
+    # # Close the realtime plot
+    # plt.close(fig)
+    # time.sleep(2)
+
+    # # get all eeg data and stop acquisition
+    # eeg.get_mne()
     eeg.stop_acquisition()
     mgr.disconnect()
 
-# Access MNE Raw object
-mne_raw = eeg.data.mne_raw
-print(f"MNE Raw object: {mne_raw}")
 
-# Access data as NumPy arrays
-data, times = mne_raw.get_data(return_times=True)
-print(f"Data shape: {data.shape}")
+# # Close brainaccess library
+# eeg.close()
 
-# save EEG data to MNE fif format
-eeg.data.save(f'./data/{time.strftime("%Y%m%d_%H%M")}-raw.fif')
+# # conversion to microvolts
+# mne_raw.apply_function(lambda x: x*10**-6)
 
-# Close brainaccess library
-eeg.close()
-
-# conversion to microvolts
-mne_raw.apply_function(lambda x: x*10**-6)
-
-# Show recorded data (post-processing plot)
-# Turn off interactive mode so plt.show() blocks
-plt.ioff() 
-mne_raw.filter(1, 40).plot(scalings="auto", verbose=False)
-plt.show()
+# # Show recorded data (post-processing plot)
+# # Turn off interactive mode so plt.show() blocks
+# plt.ioff() 
+# mne_raw.filter(1, 40).plot(scalings="auto", verbose=False)
+# plt.show()
