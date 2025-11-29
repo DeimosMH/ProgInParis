@@ -39,6 +39,7 @@ python -m venv ./venv
 source ./venv/bin/activate
 
 sudo pacman -S python-pyqt5
+sudo pacman -S tk
 ```
 
 ### Debian
