@@ -40,11 +40,6 @@ cap: dict = {
 # define device name
 device_name = "BA HALO 031"
 
-
-def sleep_ms(milliseconds):
-    """Sleep for the specified number of milliseconds"""
-    time.sleep(milliseconds / 1000.0)
-
 # start EEG acquisition setup
 with EEGManager() as mgr:
     eeg.setup(mgr, device_name=device_name, cap=halo, sfreq=250)
@@ -56,28 +51,12 @@ with EEGManager() as mgr:
 
     start_time = time.time()
     annotation = 1
-
-    while True:
-        # time.sleep(1)
-        sleep_ms(250)
-
+    while time.time() - start_time < 5:
+        time.sleep(1)
         # send annotation to the device
-        # print(f"Sending annotation {annotation} to the device")
-        
-        print("-> ")
+        print(f"Sending annotation {annotation} to the device")
         eeg.annotate(str(annotation))
         annotation += 1
-
-        eeg.get_mne()
-        
-        # Read pad prepare part of data to plot/print
-        mne_raw = eeg.data.mne_raw
-
-        # print part of data from 250ms ago
-
-        # update plot  part of data from 250ms ago
-
-
 
     print("Preparing to plot data")
     time.sleep(2)
