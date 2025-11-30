@@ -14,8 +14,7 @@ class Messenger:
         self.processor_map = {
             'double_blink': BCIProcessor.doubleBlink,
             'triple_blink': BCIProcessor.tripleBlink,
-            'blink_right': BCIProcessor.blinkRight,
-            'blink_left': BCIProcessor.blinkLeft,
+            'blink_one_eye': BCIProcessor.blinkOneEye,
             'look_right': BCIProcessor.lookRight,
             'look_left': BCIProcessor.lookLeft,
             'look_up': BCIProcessor.lookUp,

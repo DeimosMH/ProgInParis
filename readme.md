@@ -23,6 +23,9 @@ gamma - sync of the microcircuits
 - wyszukaj telefon (tel dzwoni)
 
 ----
-Blink=FP2 up, fp1 up, o2 down o1 down
-BlinkLeft= fp2 
-lookleft=
+Blink= FP1 down FP2 DOWN
+Blinkoneye = O2 up everything else down
+lookleft= O1 down else down
+LOOK right O1 up else up 
+Lookup= O1 a little down FP1 down FP2 down
+look down FP1 FP2 up
