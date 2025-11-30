@@ -203,7 +203,7 @@ class EEGApp:
             
         self.ax_raw.set_xlim(0, self.buffer_len_samples)
         self.ax_raw.set_ylim(-300, 1100)
-        self.ax_raw.set_title("Filtered EEG (uV)")
+        self.ax_raw.set_title("EEG (uV)")
         self.ax_raw.legend(loc="upper right", fontsize="x-small", framealpha=0.3)
         self.ax_raw.tick_params(left=False, labelleft=True)
 
