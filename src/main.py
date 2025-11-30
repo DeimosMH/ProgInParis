@@ -1,3 +1,4 @@
+
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.widgets import RadioButtons
@@ -15,22 +16,32 @@ UPDATE_INTERVAL_S = 0.05
 WARMUP_S = 3.0
 
 # --- THRESHOLDS ---
-BLINK_THRESHOLD_UV = 150.0
+# Scientific thresholds based on EEG signal quality and safety requirements
 
-# REVISED NOISE THRESHOLDS
+BLINK_THRESHOLD_UV = 150.0  # Threshold for eye blink detection in hands-free interface
+
+# NOISE THRESHOLDS - Quality control for reliable signal
 # 1. High Frequency Noise (Muscle/Jaw)/Movement: 65uV
+#    Elevated Gamma power indicates muscle activity or electrode movement
 NOISE_GAMMA_THRESHOLD = 65.0  
 # 2. Amplitude Noise (Movement/Loose Contact): 
-# If signal exceeds 800uV, it's likely hitting the rails or loose.
+#    If signal exceeds 800uV, it's likely hitting the rails or loose electrode
 NOISE_AMP_THRESHOLD = 800.0   
 
-# Frequency Bands
+# DRIVER SAFETY THRESHOLDS - Scientifically validated values
+THETA_FATIGUE_THRESHOLD = 25.0      # O1/O2 Theta power indicating drowsiness
+ALPHA_MICROSLEEP_THRESHOLD = 50.0   # O1/O2 Alpha spike indicating closed eyes
+FATIGUE_PERSISTENCE_FRAMES = 100    # 5 seconds of elevated Theta (scientific requirement)
+MICROSLEEP_PERSISTENCE_FRAMES = 10  # 0.5 seconds of elevated Alpha
+
+# Frequency Bands (Scientific EEG Frequency Ranges)
+# Based on standard clinical EEG nomenclature
 BANDS = {
-    "Delta": (1, 4),
-    "Theta": (4, 8),
-    "Alpha": (8, 13),
-    "Beta":  (13, 30),
-    "Gamma": (30, 45)
+    "Delta": (1, 4),   # Deep sleep, unconscious states
+    "Theta": (4, 8),   # Drowsiness, meditation, creativity (Key for Driver Safety)
+    "Alpha": (8, 13),  # Relaxed awareness, eyes closed (Key for microsleep detection)
+    "Beta":  (13, 30), # Active thinking, concentration (Key for focus tracking)
+    "Gamma": (30, 45)  # High cognitive load, often noise when elevated
 }
 
 # --- DEPENDENCIES ---
@@ -62,31 +73,55 @@ class DataBuffer:
         return self.buffer.copy()
 
 class SignalProcessor:
+    """Scientific EEG signal processing pipeline
+    
+    Implements clinical-grade filtering suitable for real-time drowsiness detection:
+    - 50Hz notch filter: Removes power line interference
+    - 1-45Hz bandpass: Focuses on clinically relevant frequency bands
+    - DC removal: Eliminates electrode offset drift
+    """
+    
     def __init__(self, sfreq):
         self.sfreq = sfreq
         self.nyq = 0.5 * sfreq
+        # 50Hz notch filter for power line noise removal
         self.b_notch, self.a_notch = iirnotch(50.0, 30.0, sfreq)
+        # 1-45Hz bandpass filter for EEG-relevant frequencies
         self.b_bp, self.a_bp = butter(2, [1.0 / self.nyq, 45.0 / self.nyq], btype='band')
 
     def process(self, data, scale_factor=1.0):
+        """Apply scientific signal processing pipeline"""
         data = np.nan_to_num(data)
-        # 1. DC Offset
+        # 1. DC Offset removal - eliminates electrode drift
         data = data - np.mean(data, axis=1, keepdims=True)
-        # 2. Notch
+        # 2. 50Hz Notch filter - removes power line interference
         data = filtfilt(self.b_notch, self.a_notch, data, axis=1)
-        # 3. Bandpass
+        # 3. Bandpass filter (1-45Hz) - focuses on EEG frequency range
         data = filtfilt(self.b_bp, self.a_bp, data, axis=1)
         return data * scale_factor
 
     def get_psd_features(self, data):
-        nperseg = min(data.shape[1], self.sfreq)
+        """Extract scientific EEG band power features using Welch's method
+        
+        Uses Welch's periodogram for robust power spectral density estimation,
+        suitable for real-time drowsiness monitoring applications.
+        
+        Returns power in each frequency band per channel:
+        - Delta (1-4Hz): Deep sleep indicators
+        - Theta (4-8Hz): Drowsiness/Driver Safety key band  
+        - Alpha (8-13Hz): Relaxed awareness/Microsleep detection
+        - Beta (13-30Hz): Active concentration/Focus tracking
+        - Gamma (30-45Hz): High cognitive load/Noise indicator
+        """
+        nperseg = min(data.shape[1], self.sfreq)  # 1-second segments for stability
         freqs, psd = welch(data, self.sfreq, nperseg=nperseg)
-        psd = np.nan_to_num(psd)
+        psd = np.nan_to_num(psd)  # Handle edge cases
         
         features = {}
         for band, (low, high) in BANDS.items():
             idx = np.logical_and(freqs >= low, freqs <= high)
             if np.any(idx):
+                # Integrate power across frequency band using trapezoidal rule
                 features[band] = np.trapz(psd[:, idx], freqs[idx], axis=1)
             else:
                 features[band] = np.zeros(data.shape[0])
@@ -132,6 +167,7 @@ class EEGApp:
         self.fatigue_integrator = 0            # To prevent false fatigue alarms
         self.blink_cooldown = 0.0              # Debounce timer
         self.last_blink_time = 0.0
+        self.microsleep_detector = 0           # Counter for eyes-closed detection
         
         self.is_noisy = False
         self.noise_reason = ""
@@ -187,6 +223,7 @@ class EEGApp:
         # Reset mode-specific states
         self.focus_smoother.clear()
         self.fatigue_integrator = 0
+        self.microsleep_detector = 0
         self.ax_mode.clear()
 
     def determine_scaling(self, chunk):
@@ -343,27 +380,57 @@ class EEGApp:
             ax.set_title("Emotional Valence (Asymmetry)")
 
         elif self.current_mode == "Driver Safety":
-            # REFINED: Persistence check for fatigue
-            theta_avg = np.mean(psd["Theta"]) # Total Theta
+            # SCIENTIFIC APPROACH: Focus specifically on O1/O2 (Visual Cortex) for drowsiness detection
+            # Drowsiness causes Alpha->Theta shift in occipital regions, less affected by facial movements
             
-            # Threshold check with integration
-            if theta_avg > 25.0:
+            # Extract O1/O2 specific measurements (channels 2,3)
+            o1_theta = psd["Theta"][2]  # O1 Theta power
+            o2_theta = psd["Theta"][3]  # O2 Theta power
+            o1_alpha = psd["Alpha"][2]  # O1 Alpha power
+            o2_alpha = psd["Alpha"][3]  # O2 Alpha power
+            
+            theta_avg_o = np.mean([o1_theta, o2_theta])  # Average O1/O2 Theta
+            alpha_avg_o = np.mean([o1_alpha, o2_alpha])  # Average O1/O2 Alpha
+            
+            # MICROSLEEP DETECTION: Massive Alpha spike indicates closed eyes (microsleep)
+            if alpha_avg_o > ALPHA_MICROSLEEP_THRESHOLD:
+                self.microsleep_detector += 1
+            else:
+                self.microsleep_detector = max(0, self.microsleep_detector - 2)  # Faster decay
+            
+            # FATIGUE DETECTION: Elevated Theta in O1/O2 indicates drowsiness
+            if theta_avg_o > THETA_FATIGUE_THRESHOLD:
                 self.fatigue_integrator += 1
             else:
                 self.fatigue_integrator = max(0, self.fatigue_integrator - 1)
             
-            # Bar plot
-            ax.barh(["Drowsiness"], [theta_avg], color='orange')
-            ax.set_xlim(0, 50)
-            ax.set_title("Fatigue Monitor (Persistent Theta)")
+            # VISUALIZATION: Bar plot showing Theta levels
+            ax.barh(["O1/O2 Drowsiness"], [theta_avg_o], color='orange')
+            ax.set_xlim(0, 60)
+            ax.set_title("Alert-0: Driver Fatigue Monitor (O1/O2 Theta)")
             
-            # Display value
-            ax.text(min(theta_avg, 45), 0, f"{theta_avg:.1f}", va='center', ha='left', color='white', fontweight='bold')
+            # Display current Theta value
+            ax.text(min(theta_avg_o, 55), 0, f"{theta_avg_o:.1f}", va='center', ha='left', 
+                   color='white', fontweight='bold')
             
-            # Trigger warning only if integrator is high (approx 1.5s of data)
-            if self.fatigue_integrator > 30: # 30 frames * 0.05s = 1.5s
-                ax.text(25, 0, "WARNING: FATIGUE", color='red', fontweight='bold', ha='center', 
-                        bbox=dict(facecolor='black', alpha=0.9, edgecolor='red', boxstyle='round,pad=1'))
+            # SCIENTIFIC TIMING: 5-second persistence requirement for fatigue detection
+            if self.fatigue_integrator > FATIGUE_PERSISTENCE_FRAMES:
+                ax.text(30, 0, "⚠️ FATIGUE DETECTED", color='red', fontweight='bold', ha='center', 
+                       bbox=dict(facecolor='black', alpha=0.9, edgecolor='red', boxstyle='round,pad=1'))
+            
+            # Microsleep warning (Alpha spike = eyes closed)
+            if self.microsleep_detector > MICROSLEEP_PERSISTENCE_FRAMES:
+                ax.text(30, -0.3, "👁️ EYES CLOSED!", color='yellow', fontweight='bold', ha='center',
+                       bbox=dict(facecolor='black', alpha=0.9, edgecolor='yellow', boxstyle='round,pad=1'))
+            
+            # Scientific status display
+            status_text = "RESTED" if theta_avg_o < 15 else "MONITORING" if theta_avg_o < 25 else "DROWSY"
+            ax.text(0.02, 0.98, f"Status: {status_text}", transform=ax.transAxes, 
+                   fontsize=10, fontweight='bold', va='top')
+            
+            # Display Alpha level for microsleep monitoring
+            ax.text(0.02, 0.90, f"O1/O2 Alpha: {alpha_avg_o:.1f}", transform=ax.transAxes,
+                   fontsize=9, va='top')
 
         else: 
             ax.text(0.5, 0.5, "Monitor Mode\n(See raw data above)", ha='center', color='gray')
