@@ -10,8 +10,18 @@ from scipy.signal import butter, filtfilt, iirnotch, welch, coherence
 DEVICE_NAME = "BA HALO 031"
 SFREQ = 250
 BUFFER_DURATION_S = 2.0  
-UPDATE_INTERVAL_S = 0.05 # Faster updates for smoother UI
+UPDATE_INTERVAL_S = 0.05 
 WARMUP_S = 3.0
+
+# --- THRESHOLDS ---
+BLINK_THRESHOLD_UV = 150.0
+
+# REVISED NOISE THRESHOLDS
+# 1. High Frequency Noise (Muscle/Jaw): 60uV
+NOISE_GAMMA_THRESHOLD = 60.0  
+# 2. Amplitude Noise (Movement/Loose Contact): 
+# If signal exceeds 800uV, it's likely hitting the rails or loose.
+NOISE_AMP_THRESHOLD = 800.0   
 
 # Frequency Bands
 BANDS = {
@@ -21,9 +31,6 @@ BANDS = {
     "Beta":  (13, 30),
     "Gamma": (30, 45)
 }
-
-# Thresholds
-BLINK_THRESHOLD_UV = 150.0
 
 # --- DEPENDENCIES ---
 try:
@@ -60,21 +67,17 @@ class SignalProcessor:
         self.b_bp, self.a_bp = butter(2, [1.0 / self.nyq, 45.0 / self.nyq], btype='band')
 
     def process(self, data, scale_factor=1.0):
-        # NaN protection: Replace NaNs with 0 to prevent crash/blank plots
         data = np.nan_to_num(data)
-        
         # 1. DC Offset
         data = data - np.mean(data, axis=1, keepdims=True)
         # 2. Notch
         data = filtfilt(self.b_notch, self.a_notch, data, axis=1)
         # 3. Bandpass
         data = filtfilt(self.b_bp, self.a_bp, data, axis=1)
-        
         return data * scale_factor
 
     def get_psd_features(self, data):
         nperseg = min(data.shape[1], self.sfreq)
-        # Add epsilon to prevent divide by zero
         freqs, psd = welch(data, self.sfreq, nperseg=nperseg)
         psd = np.nan_to_num(psd)
         
@@ -91,7 +94,7 @@ class SignalProcessor:
         try:
             f, Cxy = coherence(ch1, ch2, fs=self.sfreq, nperseg=int(self.sfreq/2))
             Cxy = np.nan_to_num(Cxy)
-            idx = np.logical_and(f >= 8, f <= 30)
+            idx = np.logical_and(f >= 8, f <= 30) # Alpha/Beta sync
             if np.any(idx):
                 return np.mean(Cxy[idx])
         except:
@@ -113,64 +116,66 @@ class EEGApp:
         self.scale_determined = False
         self.buffer_len_samples = int(BUFFER_DURATION_S * SFREQ)
 
-        # Logic
         self.processor = SignalProcessor(SFREQ)
         self.buffer = DataBuffer(4, SFREQ, BUFFER_DURATION_S)
         
-        # History arrays for scrolling plots (Size 100 points)
         self.history_len = 100
         self.history = {
             "focus_ratio": np.zeros(self.history_len),
             "asymmetry": np.zeros(self.history_len)
         }
+        
+        self.is_noisy = False
+        self.noise_reason = ""
 
-        # Setup GUI last
         self.init_gui()
 
     def init_gui(self):
         plt.style.use('dark_background')
-        self.fig = plt.figure(figsize=(12, 8))
-        gs = gridspec.GridSpec(3, 4, figure=self.fig)
+        self.fig = plt.figure(figsize=(13, 8), constrained_layout=True)
+        gs = gridspec.GridSpec(3, 5, figure=self.fig, width_ratios=[1, 1, 1, 1, 1.2])
 
         # 1. Raw EEG Plot
-        self.ax_raw = self.fig.add_subplot(gs[0, :3])
+        self.ax_raw = self.fig.add_subplot(gs[0, :4])
         self.lines_raw = []
         colors = ['#00f0f0', '#f0a000', '#00ff00', '#ff4040']
         labels = ['Fp1', 'Fp2', 'O1', 'O2']
         
-        # Initialize x-axis with dummy data so limits are set correctly immediately
         x_init = np.arange(self.buffer_len_samples)
         for i in range(4):
             line, = self.ax_raw.plot(x_init, np.zeros(self.buffer_len_samples), 
                                      color=colors[i], lw=1, label=labels[i])
             self.lines_raw.append(line)
             
-        # *** CRITICAL FIX: Explicitly set X Limits ***
         self.ax_raw.set_xlim(0, self.buffer_len_samples)
         self.ax_raw.set_ylim(-300, 1100)
         self.ax_raw.set_title("Filtered EEG (uV)")
-        self.ax_raw.legend(loc="upper right", fontsize="x-small")
+        self.ax_raw.legend(loc="upper right", fontsize="x-small", framealpha=0.3)
+        self.ax_raw.tick_params(left=False, labelleft=True)
 
         # 2. Mode Visualization
-        self.ax_mode = self.fig.add_subplot(gs[1:, :3])
+        self.ax_mode = self.fig.add_subplot(gs[1:, :4])
         
         # 3. Metrics Text
-        self.ax_metrics = self.fig.add_subplot(gs[1, 3])
+        self.ax_metrics = self.fig.add_subplot(gs[1, 4])
         self.ax_metrics.axis('off')
-        self.text_metrics = self.ax_metrics.text(0, 0.5, "Initializing...", va='center', fontsize=9)
+        self.text_metrics = self.ax_metrics.text(0.05, 0.95, "Initializing...", 
+                                                 va='top', ha='left', fontsize=8, family='monospace')
 
         # 4. Controls
-        self.ax_controls = self.fig.add_subplot(gs[2, 3])
-        self.ax_controls.set_title("Select Mode")
+        self.ax_controls = self.fig.add_subplot(gs[2, 4])
+        self.ax_controls.set_title("Select Mode", fontsize=10)
+        self.ax_controls.set_facecolor('#1e1e1e')
         self.radio = RadioButtons(self.ax_controls, self.modes, activecolor='cyan')
+        
+        for label in self.radio.labels:
+            label.set_fontsize(9)
+            label.set_color("white")
+            
         self.radio.on_clicked(self.change_mode)
-
-        plt.tight_layout()
-        plt.ion()
 
     def change_mode(self, label):
         self.current_mode = label
-        # Clear axis but don't assume limits yet, they are set in update_mode_plot
         self.ax_mode.clear()
 
     def determine_scaling(self, chunk):
@@ -194,38 +199,60 @@ class EEGApp:
         samples = np.arange(clean_data.shape[1])
         for i in range(4):
             self.lines_raw[i].set_data(samples, clean_data[i] + (i * 250))
-        
-        # Ensure x-lim stays correct (safety check)
         self.ax_raw.set_xlim(0, len(samples))
 
-        # --- METRICS & MODE PLOT ---
+        # --- METRICS & NOISE CHECK ---
         psd_pow = self.processor.get_psd_features(clean_data)
         
+        # 1. Gamma Check
+        gamma_avg = np.mean(psd_pow["Gamma"])
+        
+        # 2. Amplitude Check (Absolute max value)
+        max_amp = np.max(np.abs(clean_data))
+        
+        # Logic: Noise if Gamma is extreme OR Amplitude is railing
+        if max_amp > NOISE_AMP_THRESHOLD:
+            self.is_noisy = True
+            self.noise_reason = f"Movement ({int(max_amp)}uV)"
+        elif gamma_avg > NOISE_GAMMA_THRESHOLD:
+            self.is_noisy = True
+            self.noise_reason = f"Muscle/Jaw ({int(gamma_avg)}uV)"
+        else:
+            self.is_noisy = False
+            self.noise_reason = ""
+
+        # Stats
         fp1_a, fp2_a = psd_pow["Alpha"][0], psd_pow["Alpha"][1]
         asymmetry = (fp1_a - fp2_a) / (fp1_a + fp2_a + 1e-6)
-        
         coherence_o1_o2 = self.processor.get_coherence(clean_data[2], clean_data[3])
-        
         beta_front = np.mean(psd_pow["Beta"][:2])
         theta_front = np.mean(psd_pow["Theta"][:2])
         focus_ratio = beta_front / (theta_front + 1e-6)
 
-        self.update_mode_plot(clean_data, psd_pow, asymmetry, focus_ratio, coherence_o1_o2)
-
-        # Update Text
+        # Update Text Panel
+        status_text = f"NOISE: {self.noise_reason}" if self.is_noisy else "SIGNAL: OK"
+        
         metrics_str = (
-            f"--- GLOBAL STATS ---\n"
-            f"Alpha Sync: {coherence_o1_o2:.2f}\n"
-            f"Asym: {asymmetry:.2f}\n"
-            f"Focus: {focus_ratio:.2f}\n\n"
-            f"--- BAND POWER ---\n"
+            f"{status_text}\n"
+            f"Gamma: {gamma_avg:.1f} uV (Limit: {NOISE_GAMMA_THRESHOLD})\n"
+            f"MaxAmp: {max_amp:.0f} uV\n"
+            f"----------------------\n"
+            f"STATS:\n"
+            f"Alpha Sync:  {coherence_o1_o2:.2f}\n"
+            f"Asymmetry:   {asymmetry:.2f}\n"
+            f"Focus Ratio: {focus_ratio:.2f}\n"
+            f"----------------------\n"
+            f"BAND POWER (Avg):\n"
             f"Delta: {np.mean(psd_pow['Delta']):.1f}\n"
             f"Theta: {np.mean(psd_pow['Theta']):.1f}\n"
             f"Alpha: {np.mean(psd_pow['Alpha']):.1f}\n"
             f"Beta:  {np.mean(psd_pow['Beta']):.1f}\n"
-            f"Gamma: {np.mean(psd_pow['Gamma']):.1f}"
         )
         self.text_metrics.set_text(metrics_str)
+        self.text_metrics.set_color('#ff5555' if self.is_noisy else 'white')
+
+        # --- UPDATE MODE PLOT ---
+        self.update_mode_plot(clean_data, psd_pow, asymmetry, focus_ratio, coherence_o1_o2)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
@@ -233,9 +260,10 @@ class EEGApp:
     def update_mode_plot(self, clean_data, psd, asym, focus, coh):
         ax = self.ax_mode
         ax.clear() 
+        ax.set_facecolor('black')
 
-        # *** CRITICAL FIX: Set xlim/ylim EVERY time after clear() ***
-
+        # --- DRAW PLOTS FIRST (So we can see data even if noisy) ---
+        
         if self.current_mode == "Meditation Trainer":
             o1_a = psd["Alpha"][2]
             o2_a = psd["Alpha"][3]
@@ -250,19 +278,17 @@ class EEGApp:
             color = "gray"
             if max(fp1_ptp, fp2_ptp) > BLINK_THRESHOLD_UV:
                 status = "CLICK!"
-                color = "red"
-            
+                color = "cyan"
             ax.text(0.5, 0.5, status, fontsize=30, ha='center', va='center', color=color)
-            ax.axis('off') # Turn off axis for text mode
+            ax.axis('off')
             ax.set_title("Blink to Click")
 
         elif self.current_mode == "Focus Tracker":
             self.history["focus_ratio"] = np.roll(self.history["focus_ratio"], -1)
             self.history["focus_ratio"][-1] = focus
-            
             ax.plot(self.history["focus_ratio"], color='cyan', lw=2)
             ax.set_ylim(0, 3)
-            ax.set_xlim(0, self.history_len) # Fixed X-Axis for scrolling
+            ax.set_xlim(0, self.history_len)
             ax.axhline(1.0, color='yellow', linestyle='--', label='Zone In')
             ax.set_title(f"Focus (Beta/Theta): {focus:.2f}")
             ax.grid(True, alpha=0.3)
@@ -270,26 +296,37 @@ class EEGApp:
         elif self.current_mode == "Ad Testing":
             self.history["asymmetry"] = np.roll(self.history["asymmetry"], -1)
             self.history["asymmetry"][-1] = asym
-            
             ax.plot(self.history["asymmetry"], color='magenta', lw=2)
             ax.axhline(0, color='white')
             ax.set_ylim(-1, 1)
-            ax.set_xlim(0, self.history_len) # Fixed X-Axis for scrolling
+            ax.set_xlim(0, self.history_len)
             ax.fill_between(range(self.history_len), 0, self.history["asymmetry"], alpha=0.3, color='magenta')
             ax.set_title("Emotional Valence (Asymmetry)")
-            ax.set_ylabel("Withdrawal <---> Approach")
 
         elif self.current_mode == "Driver Safety":
             theta_avg = np.mean(psd["Theta"])
             ax.barh(["Drowsiness"], [theta_avg], color='orange')
             ax.set_xlim(0, 50)
             ax.set_title("Fatigue Monitor (Theta Power)")
-            if theta_avg > 20:
-                ax.text(10, 0, "WARNING: FATIGUE", color='red', fontweight='bold')
+            ax.text(min(theta_avg, 45), 0, f"{theta_avg:.1f}", va='center', ha='left', color='white', fontweight='bold')
+            if theta_avg > 25:
+                ax.text(25, 0, "WARNING: FATIGUE", color='red', fontweight='bold', ha='center', bbox=dict(facecolor='black', alpha=0.7))
 
         else: 
             ax.text(0.5, 0.5, "Monitor Mode\n(See raw data above)", ha='center', color='gray')
             ax.axis('off')
+
+        # --- IF NOISY, ADD OVERLAY (Don't block, just warn) ---
+        if self.is_noisy:
+            # Create a semi-transparent overlay
+            ax.patch.set_facecolor('red')
+            ax.patch.set_alpha(0.2) # 20% red tint
+            
+            # Warning text (Top center, not blocking middle)
+            ax.text(0.5, 0.9, f"⚠️ HIGH NOISE: {self.noise_reason}", 
+                    transform=ax.transAxes,
+                    fontsize=12, color='red', ha='center', fontweight='bold',
+                    bbox=dict(facecolor='black', alpha=0.8, edgecolor='red'))
 
 def main():
     app = EEGApp()
@@ -314,7 +351,7 @@ def main():
                     if raw.size > 0:
                         app.update(raw)
                 
-                plt.pause(0.001) # Allow GUI to redraw
+                plt.pause(0.001)
 
     except KeyboardInterrupt:
         logging.info("Stopping...")
