@@ -25,8 +25,16 @@ gamma - sync of the microcircuits
 ----
 
 
-Detection of EEG data:  Blinks/Jaw Clenches (EMG/EOG), Detection of eye movement, Alpha Waves (Closing eyes);
+Detection of EEG data: Detection of eye movement, Alpha Waves (Closing eyes);
 code Code
 Location is: Europe;
 Os: Arch linux + VSCode;
 The click should be <500 ms;
+
+----
+
+Documentation:
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC10097971/
+
+
+
