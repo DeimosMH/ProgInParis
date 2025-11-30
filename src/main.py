@@ -13,12 +13,20 @@ WARMUP_S = 4.0
 
 # Frequencies
 BP_LOW = 1.0
-BP_HIGH = 30.0
+BP_HIGH = 45.0  # Increased slightly to allow EMG detection before filtering cuts it off completely
 NOTCH_FREQ = 50.0
 
-# Detection Thresholds
-BLINK_THRESHOLD_UV = 150.0 
-ALPHA_THRESHOLD_REL = 0.4 
+# --- DETECTION THRESHOLDS ---
+# 1. Error Rejection (Muscle/Movement Noise)
+# Threshold for power in 30Hz+ band. If exceeded, ignore window.
+EMG_THRESHOLD_REL = 30.0 
+
+# 2. Eye Events (Frontal Channels)
+BLINK_THRESHOLD_UV = 150.0      # Hard Blinks are usually > 150uV
+EYE_MOVE_THRESHOLD_UV = 70.0    # Eye movements are usually 70-150uV
+
+# 3. Brain States (Occipital Channels)
+ALPHA_THRESHOLD_REL = 1.5       # Relative PSD power
 
 # --- DEPENDENCIES ---
 try:
@@ -58,69 +66,102 @@ def apply_robust_filters(data, sfreq):
     # 2. Notch (50Hz)
     b_notch, a_notch = iirnotch(NOTCH_FREQ, 30.0, sfreq)
     data = filtfilt(b_notch, a_notch, data, axis=1)
-    # 3. Bandpass (1-30Hz)
+    # 3. Bandpass (1-45Hz)
     nyquist = 0.5 * sfreq
     b_bp, a_bp = butter(2, [BP_LOW / nyquist, BP_HIGH / nyquist], btype='band')
     data = filtfilt(b_bp, a_bp, data, axis=1)
     return data
 
 def get_band_power(data, sfreq, band_limits):
+    """
+    Returns absolute power in a specific band.
+    """
     n_samples = data.shape[-1]
-    nperseg = min(n_samples, sfreq)
+    nperseg = min(n_samples, sfreq) # 1 sec window for Welch
     freqs, psd = welch(data, sfreq, nperseg=nperseg)
     
     freq_res = freqs[1] - freqs[0]
-    total_power = np.trapz(psd, dx=freq_res) + 1e-10
     idx_band = np.logical_and(freqs >= band_limits[0], freqs <= band_limits[1])
     band_power = np.trapz(psd[..., idx_band], dx=freq_res)
-    return band_power / total_power
+    return band_power
 
 def detect_artifacts_and_waves(clean_data_uv, sfreq):
     """
-    Expects data ALREADY scaled to Microvolts (uV).
+    Priority:
+    1. Detect NOISE (Head movement, Jaw clench/Reading) -> IGNORE
+    2. Detect BLINK (High amplitude)
+    3. Detect EYE MOVEMENT (Medium amplitude, shifts)
+    4. Detect ALPHA (Resting state)
     """
     n_samples_check = int(0.5 * sfreq) 
-    recent_data = clean_data_uv[:, -n_samples_check:]
+    # Frontal channels (Fp1, Fp2) usually indices 0 and 1
+    # Occipital channels (O1, O2) usually indices 2 and 3
     
-    if recent_data.shape[1] < 10: return "WAITING"
-
-    # Blink (Fp1=0, Fp2=1)
-    # Data is already uV, do NOT multiply by 1e6 again
-    fp1_ptp = np.ptp(recent_data[0]) 
-    fp2_ptp = np.ptp(recent_data[1]) 
-
-    # Alpha (O1=2, O2=3)
-    o1_alpha_rel = get_band_power(clean_data_uv[2], sfreq, [8, 12])
-    o2_alpha_rel = get_band_power(clean_data_uv[3], sfreq, [8, 12])
-    avg_alpha = (o1_alpha_rel + o2_alpha_rel) / 2
-
-    if fp1_ptp > BLINK_THRESHOLD_UV or fp2_ptp > BLINK_THRESHOLD_UV:
-        return f"BLINK ({int(max(fp1_ptp, fp2_ptp))}uV)"
+    # Analyze only the most recent 0.5s for events, but use full buffer for frequency analysis
+    recent_frontal = clean_data_uv[0:2, -n_samples_check:]
+    full_frontal = clean_data_uv[0:2, :]
+    full_occipital = clean_data_uv[2:4, :]
     
-    if avg_alpha > ALPHA_THRESHOLD_REL:
-        return f"ALPHA ({avg_alpha:.2f})"
+    if recent_frontal.shape[1] < 10: return "WAITING"
+
+    # --- 1. NOISE / ERROR DETECTION ---
+    # The 'err' images (Head movement, Reading) generate high frequency noise (EMG).
+    # We check for high power in Gamma band (30-45Hz in filtered data, or higher if raw).
+    # Since we low-pass at 45Hz, we check the upper edge.
+    emg_power = get_band_power(full_frontal, sfreq, [30, 45])
+    # Average across Fp1/Fp2
+    avg_emg = np.mean(emg_power)
+    
+    # Heuristic: If high frequency power is massive, it's not a clean blink/move, it's noise.
+    if avg_emg > EMG_THRESHOLD_REL:
+        return f"WAITING (High Noise: {avg_emg:.1f})"
+
+    # --- 2. BLINK DETECTION ---
+    # Blinks are characterized by very high amplitude peaks in Frontal channels.
+    fp1_ptp = np.ptp(recent_frontal[0]) 
+    fp2_ptp = np.ptp(recent_frontal[1]) 
+    max_amp = max(fp1_ptp, fp2_ptp)
+
+    if max_amp > BLINK_THRESHOLD_UV:
+        return f"BLINK (Amp: {int(max_amp)}uV)"
+
+    # --- 3. EYE MOVEMENT DETECTION ---
+    # Look for "Left to Right" or "Up Down" (non-blink).
+    # These are usually significant potential shifts but often lower amplitude than a hard blink,
+    # or wider. For this simple logic, we use an amplitude window below Blink but above EEG.
+    if max_amp > EYE_MOVE_THRESHOLD_UV:
+        return f"EYE MOVEMENT (Amp: {int(max_amp)}uV)"
+    
+    # --- 4. ALPHA DETECTION ---
+    # Only check if eyes are relatively still
+    o1_alpha = get_band_power(full_occipital[0], sfreq, [8, 12])
+    o2_alpha = get_band_power(full_occipital[1], sfreq, [8, 12])
+    
+    # Normalize by Delta/Theta to get relative alpha (prevents 1/f detection)
+    o1_low = get_band_power(full_occipital[0], sfreq, [1, 5]) + 1e-10
+    o2_low = get_band_power(full_occipital[1], sfreq, [1, 5]) + 1e-10
+    
+    ratio = ((o1_alpha/o1_low) + (o2_alpha/o2_low)) / 2
+
+    if ratio > ALPHA_THRESHOLD_REL:
+        return f"ALPHA WAVE (Ratio: {ratio:.2f})"
         
     return "NONE"
 
-def update_plot(ax, clean_data_uv, ch_names):
+def update_plot(ax, clean_data_uv, ch_names, detection_text):
     ax.clear()
     samples = np.arange(clean_data_uv.shape[1])
     for i in range(clean_data_uv.shape[0]):
-        # Data is already uV. Add 200uV offset per channel for clarity.
-        signal_uv = clean_data_uv[i] + (i * 200) 
+        # Add offset per channel for waterfall plot
+        signal_uv = clean_data_uv[i] + (i * 250) 
         ax.plot(samples, signal_uv, label=ch_names[i], linewidth=1)
     
-    ax.set_ylim(-200, 1000)
-    ax.set_title("Filtered EEG (uV)")
+    ax.set_ylim(-300, 1300)
+    ax.set_title(f"EEG Monitor - State: {detection_text}")
     ax.legend(loc="upper right", fontsize="small")
     plt.pause(0.001)
 
 def determine_scaling(data_chunk):
-    """
-    Heuristic: Standard EEG is ~50uV.
-    If Mean > 1.0, it's likely already uV (or counts). Scale = 1.0
-    If Mean < 1.0 (e.g. 0.00005), it's Volts. Scale = 1e6.
-    """
     mean_val = np.mean(np.abs(data_chunk))
     if mean_val > 1.0:
         return 1.0
@@ -132,28 +173,28 @@ def main():
     try:
         matplotlib.use('TkAgg')
         plt.ion()
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(figsize=(10, 6))
         plot_enabled = True
     except Exception:
         logging.warning("Plotting disabled.")
         plot_enabled = False
     
-    last_blink_time = 0
+    last_event_time = 0
     cap = {0: "Fp1", 1: "Fp2", 2: "O1", 3: "O2"}
     
-    # Auto-scaling state
     scale_factor = 1.0
     scale_determined = False
     
+    current_decision = "Init"
+
     try:
         with EEGManager() as mgr:
             logging.info(f"Connecting to {DEVICE_NAME}...")
-            # Ensure buffer size is adequate in driver
             driver_buffer = int(BUFFER_DURATION_S * SFREQ)
             eeg.setup(mgr, device_name=DEVICE_NAME, cap=cap, sfreq=SFREQ, zeros_at_start=driver_buffer)
 
             eeg.start_acquisition()
-            logging.info("Acquisition started. Warming up...")
+            logging.info("Acquisition started. Stabilization...")
             time.sleep(2.0)
 
             data_buffer = DataBuffer(n_channels=4, sfreq=SFREQ, duration_s=BUFFER_DURATION_S)
@@ -162,52 +203,52 @@ def main():
             while True:
                 loop_start = time.time()
                 
-                # Fetch Data
                 mne_chunk = eeg.get_mne(tim=CYCLE_DURATION_S)
                 if mne_chunk is None or len(mne_chunk) == 0:
                     time.sleep(0.01)
                     continue
                 
-                # Get raw array (Channels x Samples)
                 raw_chunk = mne_chunk.get_data()[:4, :].copy()
-                
-                # Safety check for empty data
                 if raw_chunk.size == 0: continue
 
-                # --- AUTO SCALING ---
-                # Determine units on the first valid chunk
                 if not scale_determined:
                     scale_factor = determine_scaling(raw_chunk)
-                    logging.info(f"Auto-detected Scale Factor: {scale_factor} (Mean amp: {np.mean(np.abs(raw_chunk)):.4f})")
+                    logging.info(f"Scale Factor: {scale_factor}")
                     scale_determined = True
 
-                # Update Buffer
                 data_buffer.update(raw_chunk)
                 
                 if time.time() - start_time > WARMUP_S:
-                    # Get 2s window
                     full_window = data_buffer.get_data()
                     
                     try:
                         # 1. Filter
                         clean_window = apply_robust_filters(full_window, SFREQ)
-                        
-                        # 2. Scale to Microvolts (uV)
                         clean_window_uv = clean_window * scale_factor
                         
-                        # 3. Detect
+                        # 2. Detect with Error Ignoring Logic
                         decision = detect_artifacts_and_waves(clean_window_uv, SFREQ)
                         
-                        if "BLINK" in decision:
-                            if (time.time() - last_blink_time) > 1.0:
-                                logging.info(f"--- DETECTED: {decision} ---")
-                                last_blink_time = time.time()
+                        # Logic to prevent console spam
+                        if "BLINK" in decision or "EYE" in decision:
+                            if (time.time() - last_event_time) > 0.8:
+                                logging.info(f">>> {decision}")
+                                current_decision = decision
+                                last_event_time = time.time()
+                        elif "WAITING" in decision:
+                            # Do not log standard waiting, only update plot state
+                            current_decision = decision
                         elif "ALPHA" in decision:
-                            logging.info(f"State: {decision}")
+                            current_decision = decision
+                            if time.time() - last_event_time > 1.0:
+                                logging.info(f"State: {decision}")
+                                last_event_time = time.time()
+                        else:
+                            current_decision = "Monitoring..."
 
-                        # 4. Plot
+                        # 3. Plot
                         if plot_enabled:
-                            update_plot(ax, clean_window_uv, ["Fp1", "Fp2", "O1", "O2"])
+                            update_plot(ax, clean_window_uv, ["Fp1", "Fp2", "O1", "O2"], current_decision)
                             
                     except Exception as e:
                         logging.error(f"Processing error: {e}")
