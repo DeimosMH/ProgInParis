@@ -61,24 +61,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- CONFIGURATION ---
 DEVICE_NAME = "BA HALO 031"
 SFREQ = 250
-CYCLE_DURATION_S = 0.1  # Process data every 100ms, ensuring <500ms latency
+CYCLE_DURATION_S = 0.1  # Process data every 100ms
 BUFFER_SIZE_S = 3.0     # The total size of the rolling buffer
 
-# --- UPDATED: Example HALO_CAP including channels for jaw clench detection ---
-# NOTE: Update this dictionary to match your actual device's channel mapping.
-# T7 and T8 are required for robust jaw clench detection.
-# F7 and F8 are often used for horizontal eye movement but Fp1/Fp2 can also work.
 HALO_CAP: dict = {
-    0: "Fp1", 1: "Fp2",
-    2: "O1",  3: "O2",
-    # 4: "T7",  5: "T8"  # Example channels for jaw clench
+    0: "Fp1",
+    1: "Fp2",
+    2: "O1",
+    3: "O2",
 }
 
 PROCESSING_CONFIG = {
     "method": "bandpass_causal",
     "bp_low": 1,
-    "bp_high": 40,
-    "notch_freq": 50.0,  # Correct for European mains hum
+    "bp_high": 40,  # Increased to capture more EMG/EOG
+    "notch_freq": 50.0,
     "notch_q": 30.0
 }
 
@@ -98,7 +95,7 @@ def bandpower(data, sfreq, band, relative=False):
     
     band = np.asarray(band)
     low, high = band
-    nperseg = min(data.shape[-1], sfreq)
+    nperseg = min(data.shape[-1], sfreq) # Use 1-second windows or less
     
     freqs, psd = sp_signal.welch(data, sfreq, nperseg=nperseg)
     
@@ -110,15 +107,16 @@ def bandpower(data, sfreq, band, relative=False):
     power = np.trapz(psd[..., idx_band], dx=freq_res)
     
     if relative:
-        total_power = np.trapz(psd, dx=freq_res) + 1e-10 # Add epsilon to avoid division by zero
-        return power / total_power
+        total_power = np.trapz(psd, dx=freq_res)
+        return power / (total_power + 1e-10)
     return power
 
 def apply_causal_filters(data, sfreq):
-    """Applies configured causal filtering with robust state management."""
+    """Applies configured causal filtering, protected against instability."""
     global filter_state
-    
-    voltage_limit = 500e-6  # 500 microvolts clip to prevent filter instability
+
+    # This clip is still essential to prevent the filter from exploding after a large artifact.
+    voltage_limit = 500e-6  # 500 microvolts
     np.clip(data, -voltage_limit, voltage_limit, out=data)
 
     if not SCIPY_AVAILABLE or data.shape[1] == 0:
@@ -131,18 +129,16 @@ def apply_causal_filters(data, sfreq):
 
         n_channels = data.shape[0]
         
-        # The zi array shape must be (n_channels, filter_order) for axis=1 filtering.
-        if filter_state['bandpass'] is None or filter_state['bandpass'].shape[0] != n_channels:
-            zi_1d = lfilter_zi(b_bp, a_bp) # Shape: (filter_order,)
-            # Broadcast to create the correct (n_channels, filter_order) array
-            filter_state['bandpass'] = np.ones((n_channels, 1)) * zi_1d
+        # --- FIX: ROBUST FILTER STATE INITIALIZATION USING BROADCASTING ---
+        if filter_state['bandpass'] is None or filter_state['bandpass'].shape[1] != n_channels:
+            zi_1d = lfilter_zi(b_bp, a_bp)
+            # Use broadcasting to create the (order, n_channels) array
+            filter_state['bandpass'] = zi_1d[:, np.newaxis] * np.ones((1, n_channels))
             
-        if filter_state['notch'] is None or filter_state['notch'].shape[0] != n_channels:
-            zi_1d = lfilter_zi(b_notch, a_notch) # Shape: (filter_order,)
-            # Broadcast to create the correct (n_channels, filter_order) array
-            filter_state['notch'] = np.ones((n_channels, 1)) * zi_1d
-        
-
+        if filter_state['notch'] is None or filter_state['notch'].shape[1] != n_channels:
+            zi_1d = lfilter_zi(b_notch, a_notch)
+            filter_state['notch'] = zi_1d[:, np.newaxis] * np.ones((1, n_channels))
+        # --- END FIX ---
 
         filtered_data, filter_state['notch'] = lfilter(b_notch, a_notch, data, axis=1, zi=filter_state['notch'])
         filtered_data, filter_state['bandpass'] = lfilter(b_bp, a_bp, filtered_data, axis=1, zi=filter_state['bandpass'])
@@ -153,68 +149,24 @@ def apply_causal_filters(data, sfreq):
         filter_state = {'bandpass': None, 'notch': None} # Reset state on error
         return data
 
-def detect_blinks(data, ch_names, channels=['Fp1', 'Fp2'], threshold_v=100e-6):
-    """Detects blinks using Peak-to-Peak amplitude on frontal channels."""
+
+def detect_artifact(data, ch_names, channels, threshold_v):
+    """Generic artifact detector using Peak-to-Peak amplitude."""
     try:
-        if not all(ch in ch_names for ch in channels): return False
+        for ch in channels:
+            if ch not in ch_names: return False
+        
         indices = [ch_names.index(ch) for ch in channels]
         ptp_values = [np.ptp(data[i]) for i in indices]
+
         return all(ptp > threshold_v for ptp in ptp_values)
     except (ValueError, IndexError):
         return False
 
-def detect_jaw_clench(data, ch_names, sfreq, channels=['T7', 'T8'], threshold_power=0.6):
-    """
-    Detects jaw clench (EMG artifact) by checking for high relative power in the 20-40 Hz band.
-    NOTE: Requires temporal channels like T7/T8 for best performance.
-    """
+def detect_alpha_waves(data, ch_names, sfreq, relative_power_threshold=0.35):
+    """Detects alpha waves on any available occipital channel."""
     try:
-        if not any(ch in ch_names for ch in channels): return False
-        
-        for ch_name in channels:
-            if ch_name in ch_names:
-                idx = ch_names.index(ch_name)
-                # Check for high-frequency muscle artifact
-                emg_power = bandpower(data[idx], sfreq, [20, 40], relative=True)
-                if emg_power > threshold_power:
-                    return True
-        return False
-    except Exception as e:
-        logging.warning(f"Jaw clench detection failed: {e}")
-        return False
-
-def detect_eye_movement(data, ch_names, channels=['Fp1', 'Fp2'], threshold_v=50e-6, corr_threshold=-0.5):
-    """
-    Detects horizontal eye movements by looking for strong, anti-correlated signals
-    in the frontal channels.
-    """
-    try:
-        if not all(ch in ch_names for ch in channels): return False
-        indices = [ch_names.index(ch) for ch in channels]
-        
-        ch_data = data[indices]
-        
-        # Condition 1: Sufficient amplitude
-        ptp_values = [np.ptp(d) for d in ch_data]
-        if not all(ptp > threshold_v for ptp in ptp_values):
-            return False
-            
-        # Condition 2: Strong negative correlation (out of phase)
-        if ch_data.shape[1] > 1:
-            correlation = np.corrcoef(ch_data)[0, 1]
-            if correlation < corr_threshold:
-                return True
-        
-        return False
-    except (ValueError, IndexError):
-        return False
-
-def detect_alpha_waves(data, ch_names, sfreq, channels=['O1', 'O2'], relative_power_threshold=0.35):
-    """Detects alpha waves on available occipital channels."""
-    try:
-        if not any(ch in ch_names for ch in channels): return False
-        
-        for ch_name in channels:
+        for ch_name in ['O1', 'O2']:
             if ch_name in ch_names:
                 idx = ch_names.index(ch_name)
                 if data.shape[1] < sfreq * 0.5: continue
@@ -228,19 +180,16 @@ def detect_alpha_waves(data, ch_names, sfreq, channels=['O1', 'O2'], relative_po
         return False
 
 def make_decision(eeg_data, channel_names, sfreq):
-    """Main pattern recognition function with a clear hierarchy."""
-    if detect_blinks(eeg_data, channel_names, threshold_v=100e-6):
+    """Main pattern recognition function."""
+    if detect_artifact(eeg_data, channel_names, ['Fp1', 'Fp2'], threshold_v=100e-6):
         return "BLINK"
-    if detect_jaw_clench(eeg_data, channel_names, sfreq):
-        return "JAW_CLENCH"
-    if detect_eye_movement(eeg_data, channel_names):
-        return "EYE_MOVEMENT"
+    # NOTE: Jaw clench detection requires T7/T8 which are not in the current HALO_CAP
     if detect_alpha_waves(eeg_data, channel_names, sfreq):
         return "ALPHA_WAVES"
     return "NONE"
 
 def update_plot(eeg, ax):
-    """Fetches and plots data using a non-causal filter for smoother visualization."""
+    """Fetches and plots data using its own non-causal filter for visualization."""
     global PLOT_ENABLED
     if not eeg or not PLOT_ENABLED: return
     try:
@@ -248,7 +197,6 @@ def update_plot(eeg, ax):
         if mne_raw_plot and mne_raw_plot.get_data().shape[1] > 30:
             data, _ = mne_raw_plot.get_data(return_times=True)
             
-            # Use a non-causal filtfilt for prettier plotting
             b, a = butter(2, [PROCESSING_CONFIG["bp_low"] / (0.5*eeg.sfreq), PROCESSING_CONFIG["bp_high"] / (0.5*eeg.sfreq)], btype='band')
             clean_data = filtfilt(b, a, data, axis=1)
 
@@ -257,14 +205,13 @@ def update_plot(eeg, ax):
                 offset = i * 100
                 signal = (clean_data[i] * 1e6) - np.mean(clean_data[i] * 1e6) + offset
                 ax.plot(signal, label=ch_name, linewidth=0.8)
-            ax.set_title(f"Live EEG Data")
+            ax.set_title(f"Live EEG ({PROCESSING_CONFIG['method']})")
             ax.set_ylabel("Amplitude (uV) + Offset")
-            ax.set_xlabel("Samples")
             ax.legend(loc='upper right', fontsize='small')
             plt.pause(0.001)
     except Exception as e:
         logging.error(f"Plotting error: {e}")
-        PLOT_ENABLED = False # Disable plotting on error
+        PLOT_ENABLED = False
 
 def main():
     """Main function to run the real-time BCI loop."""
@@ -273,14 +220,13 @@ def main():
         logging.error("Missing critical libraries (BrainAccess or Scipy). Cannot run.")
         return
 
-    filter_state = {'bandpass': None, 'notch': None} # Reset state on start
+    filter_state = {'bandpass': None, 'notch': None}
     eeg = acquisition.EEG(mode="roll")
     
     fig, ax = None, None
     if PLOT_ENABLED:
         try:
-            # Attempt to use a backend that supports interactive plotting
-            matplotlib.use("TkAgg", force=True)
+            matplotlib.use("TKAgg", force=True)
             plt.ion()
             fig, ax = plt.subplots(figsize=(12, 6))
         except Exception:
@@ -295,7 +241,7 @@ def main():
             
             eeg.start_acquisition()
             logging.info("Acquisition started. BCI loop running... (Press Ctrl+C to stop)")
-            time.sleep(1.5) # Wait for buffer to fill a bit
+            time.sleep(1.5)
 
             last_plot_time = time.time()
             
@@ -307,8 +253,8 @@ def main():
                     time.sleep(0.01)
                     continue
 
-                raw_data = mne_raw.get_data().copy() # Work on a copy
-                clean_data = apply_causal_filters(raw_data, eeg.sfreq)
+                raw_data, _ = mne_raw.get_data(return_times=True)
+                clean_data = apply_causal_filters(raw_data.copy(), eeg.sfreq)
                 
                 decision = make_decision(clean_data, mne_raw.ch_names, eeg.sfreq)
                 if decision != "NONE":
@@ -322,8 +268,8 @@ def main():
                 sleep_duration = CYCLE_DURATION_S - processing_time
                 if sleep_duration > 0:
                     time.sleep(sleep_duration)
-                else: # sleep_duration <= 0
-                    logging.warning(f"Cycle overrun by {abs(int(sleep_duration * 1000))} ms.")
+                elif processing_time > CYCLE_DURATION_S:
+                    logging.warning(f"Cycle overrun by {int((processing_time - CYCLE_DURATION_S) * 1000)} ms.")
 
     except (KeyboardInterrupt, SystemExit):
         logging.info("User interrupted. Shutting down.")

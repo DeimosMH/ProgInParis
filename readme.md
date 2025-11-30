@@ -23,3 +23,10 @@ gamma - sync of the microcircuits
 - wyszukaj telefon (tel dzwoni)
 
 ----
+
+
+Detection of EEG data:  Blinks/Jaw Clenches (EMG/EOG), Detection of eye movement, Alpha Waves (Closing eyes);
+code Code
+Location is: Europe;
+Os: Arch linux + VSCode;
+The click should be <500 ms;
