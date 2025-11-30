@@ -1,4 +1,4 @@
-from BCI_Processor import BCIProcessor 
+from src.BCI_Processor import BCIProcessor 
 
 class Messenger:
     """
@@ -51,6 +51,10 @@ class Messenger:
         self.actions.clear() 
         print(f"--- Finished processing {processed_count} action(s) ---\n")
 
-    def sendChartData(self, data :list()):
+    def sendChartData(self, data ):
         BCIProcessor.signalData(data)
+    
+
+
+
 

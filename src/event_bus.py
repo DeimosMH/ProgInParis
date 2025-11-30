@@ -1,6 +1,7 @@
-from PyQt6.QtCore import QObject, pyqtSignal
+from PySide6.QtCore import QObject, Signal
 
 class EventBus(QObject):
-    dataforchart = pyqtSignal()
+    dataforchart = Signal()
 
 event_bus = EventBus()
+
