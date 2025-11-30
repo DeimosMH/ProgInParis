@@ -18,8 +18,8 @@ WARMUP_S = 3.0
 BLINK_THRESHOLD_UV = 150.0
 
 # REVISED NOISE THRESHOLDS
-# 1. High Frequency Noise (Muscle/Jaw): 60uV
-NOISE_GAMMA_THRESHOLD = 60.0  
+# 1. High Frequency Noise (Muscle/Jaw)/Movement: 65uV
+NOISE_GAMMA_THRESHOLD = 65.0  
 # 2. Amplitude Noise (Movement/Loose Contact): 
 # If signal exceeds 800uV, it's likely hitting the rails or loose.
 NOISE_AMP_THRESHOLD = 800.0   
