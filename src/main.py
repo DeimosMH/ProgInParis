@@ -28,20 +28,26 @@ NOISE_GAMMA_THRESHOLD = 65.0
 #    If signal exceeds 800uV, it's likely hitting the rails or loose electrode
 NOISE_AMP_THRESHOLD = 800.0   
 
+# FAA SPECIFIC THRESHOLDS
+# Delta power (1-4Hz) in Fp1/Fp2 is the primary signature of eye movements.
+# If Frontal Delta > 75 uV^2/Hz (approx), it's likely an eye movement, not an emotion.
+FAA_EOG_LIMIT = 75.0 
+
+
 # DRIVER SAFETY THRESHOLDS - Scientifically validated values
 THETA_FATIGUE_THRESHOLD = 25.0      # O1/O2 Theta power indicating drowsiness
 ALPHA_MICROSLEEP_THRESHOLD = 50.0   # O1/O2 Alpha spike indicating closed eyes
 FATIGUE_PERSISTENCE_FRAMES = 100    # 5 seconds of elevated Theta (scientific requirement)
 MICROSLEEP_PERSISTENCE_FRAMES = 10  # 0.5 seconds of elevated Alpha
 
-# Frequency Bands (Scientific EEG Frequency Ranges)
-# Based on standard clinical EEG nomenclature
+
+# Frequency Bands
 BANDS = {
-    "Delta": (1, 4),   # Deep sleep, unconscious states
-    "Theta": (4, 8),   # Drowsiness, meditation, creativity (Key for Driver Safety)
-    "Alpha": (8, 13),  # Relaxed awareness, eyes closed (Key for microsleep detection)
-    "Beta":  (13, 30), # Active thinking, concentration (Key for focus tracking)
-    "Gamma": (30, 45)  # High cognitive load, often noise when elevated
+    "Delta": (1, 4),
+    "Theta": (4, 8),
+    "Alpha": (8, 13),
+    "Beta":  (13, 30),
+    "Gamma": (30, 45)
 }
 
 # --- DEPENDENCIES ---
@@ -50,7 +56,6 @@ try:
     from brainaccess.core.eeg_manager import EEGManager
 except ImportError:
     logging.error("BrainAccess libraries missing.")
-    # For testing without device, we continue but main() will fail if called
     pass
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -75,12 +80,12 @@ class DataBuffer:
 class SignalProcessor:
     """Scientific EEG signal processing pipeline
     
-    Implements clinical-grade filtering suitable for real-time drowsiness detection:
+    Filtering suitable for real-time drowsiness detection:
     - 50Hz notch filter: Removes power line interference
     - 1-45Hz bandpass: Focuses on clinically relevant frequency bands
     - DC removal: Eliminates electrode offset drift
     """
-    
+
     def __init__(self, sfreq):
         self.sfreq = sfreq
         self.nyq = 0.5 * sfreq
@@ -99,8 +104,9 @@ class SignalProcessor:
         # 3. Bandpass filter (1-45Hz) - focuses on EEG frequency range
         data = filtfilt(self.b_bp, self.a_bp, data, axis=1)
         return data * scale_factor
-
+    
     def get_psd_features(self, data):
+
         """Extract scientific EEG band power features using Welch's method
         
         Uses Welch's periodogram for robust power spectral density estimation,
@@ -113,15 +119,14 @@ class SignalProcessor:
         - Beta (13-30Hz): Active concentration/Focus tracking
         - Gamma (30-45Hz): High cognitive load/Noise indicator
         """
-        nperseg = min(data.shape[1], self.sfreq)  # 1-second segments for stability
+        nperseg = min(data.shape[1], self.sfreq)
         freqs, psd = welch(data, self.sfreq, nperseg=nperseg)
-        psd = np.nan_to_num(psd)  # Handle edge cases
+        psd = np.nan_to_num(psd)
         
         features = {}
         for band, (low, high) in BANDS.items():
             idx = np.logical_and(freqs >= low, freqs <= high)
             if np.any(idx):
-                # Integrate power across frequency band using trapezoidal rule
                 features[band] = np.trapz(psd[:, idx], freqs[idx], axis=1)
             else:
                 features[band] = np.zeros(data.shape[0])
@@ -159,18 +164,23 @@ class EEGApp:
         self.history_len = 100
         self.history = {
             "focus_ratio": np.zeros(self.history_len),
-            "asymmetry": np.zeros(self.history_len)
+            "asymmetry": np.zeros(self.history_len),
+            "attention": np.zeros(self.history_len) # New metric for Ad Testing
         }
         
         # --- NEW STATE VARIABLES ---
-        self.focus_smoother = deque(maxlen=20) # Smooth over ~1 second
-        self.fatigue_integrator = 0            # To prevent false fatigue alarms
-        self.blink_cooldown = 0.0              # Debounce timer
+        self.focus_smoother = deque(maxlen=20) 
+        self.fatigue_integrator = 0            
+        self.blink_cooldown = 0.0              
         self.last_blink_time = 0.0
         self.microsleep_detector = 0           # Counter for eyes-closed detection
         
         self.is_noisy = False
         self.noise_reason = ""
+        
+        # Valid Asymmetry Memory
+        self.last_valid_asymmetry = 0.0
+        self.eog_artifact_active = False
 
         self.init_gui()
 
@@ -220,11 +230,11 @@ class EEGApp:
 
     def change_mode(self, label):
         self.current_mode = label
-        # Reset mode-specific states
         self.focus_smoother.clear()
         self.fatigue_integrator = 0
         self.microsleep_detector = 0
         self.ax_mode.clear()
+        self.history["asymmetry"][:] = 0
 
     def determine_scaling(self, chunk):
         mean_val = np.mean(np.abs(chunk))
@@ -259,6 +269,7 @@ class EEGApp:
         max_amp = np.max(np.abs(clean_data))
         
         # Logic: Noise if Gamma is extreme OR Amplitude is railing
+        
         if max_amp > NOISE_AMP_THRESHOLD:
             self.is_noisy = True
             self.noise_reason = f"Movement ({int(max_amp)}uV)"
@@ -269,9 +280,24 @@ class EEGApp:
             self.is_noisy = False
             self.noise_reason = ""
 
-        # Stats
-        fp1_a, fp2_a = psd_pow["Alpha"][0], psd_pow["Alpha"][1]
-        asymmetry = (fp1_a - fp2_a) / (fp1_a + fp2_a + 1e-6)
+        # 2. Eye Movement / Saccade Detection (for Ad Testing)
+        # High Delta in Frontal channels usually means blinking or scanning
+        frontal_delta = np.mean(psd_pow["Delta"][:2])
+        if frontal_delta > FAA_EOG_LIMIT:
+            self.eog_artifact_active = True
+        else:
+            self.eog_artifact_active = False
+
+        # 3. Calculate Stats
+        
+        # Asymmetry: Gated by EOG
+        if not self.eog_artifact_active:
+            fp1_a, fp2_a = psd_pow["Alpha"][0], psd_pow["Alpha"][1]
+            current_asym = (fp1_a - fp2_a) / (fp1_a + fp2_a + 1e-6)
+            self.last_valid_asymmetry = current_asym
+        else:
+            current_asym = self.last_valid_asymmetry # Hold value
+
         coherence_o1_o2 = self.processor.get_coherence(clean_data[2], clean_data[3])
         
         # Focus Calculation (Smoothed)
@@ -281,18 +307,25 @@ class EEGApp:
         self.focus_smoother.append(raw_focus)
         focus_ratio = np.mean(self.focus_smoother) if self.focus_smoother else 0.0
 
+        # Visual Attention (Occipital Beta / Alpha) - Less sensitive to EOG
+        occ_beta = np.mean(psd_pow["Beta"][2:])
+        occ_alpha = np.mean(psd_pow["Alpha"][2:])
+        vis_attention = occ_beta / (occ_alpha + 1e-6)
+
         # Update Text Panel
         status_text = f"NOISE: {self.noise_reason}" if self.is_noisy else "SIGNAL: OK"
         
         metrics_str = (
             f"{status_text}\n"
             f"Gamma: {gamma_avg:.1f} uV (Limit: {NOISE_GAMMA_THRESHOLD})\n"
+            f"EOG Activity: {'DETECTED' if self.eog_artifact_active else 'Low'}\n"
             f"MaxAmp: {max_amp:.0f} uV\n"
             f"----------------------\n"
             f"STATS:\n"
+            f"Valence (FAA): {current_asym:.2f}\n"
+            f"Vis Attention: {vis_attention:.2f}\n"
             f"Alpha Sync:  {coherence_o1_o2:.2f}\n"
-            f"Asymmetry:   {asymmetry:.2f}\n"
-            f"Focus Ratio: {focus_ratio:.2f}\n"
+            f"Focus Ratio:   {focus_ratio:.2f}\n"
             f"----------------------\n"
             f"BAND POWER (Avg):\n"
             f"Delta: {np.mean(psd_pow['Delta']):.1f}\n"
@@ -304,12 +337,12 @@ class EEGApp:
         self.text_metrics.set_color('#ff5555' if self.is_noisy else 'white')
 
         # --- UPDATE MODE PLOT ---
-        self.update_mode_plot(clean_data, psd_pow, asymmetry, focus_ratio, coherence_o1_o2)
+        self.update_mode_plot(clean_data, psd_pow, current_asym, focus_ratio, coherence_o1_o2, vis_attention)
 
         self.fig.canvas.draw_idle()
         self.fig.canvas.flush_events()
 
-    def update_mode_plot(self, clean_data, psd, asym, focus, coh):
+    def update_mode_plot(self, clean_data, psd, asym, focus, coh, vis_attn):
         ax = self.ax_mode
         ax.clear() 
         ax.set_facecolor('black')
@@ -324,15 +357,14 @@ class EEGApp:
             ax.set_title(f"MEDITATION (Alpha Power) - Sync: {coh:.2f}")
 
         elif self.current_mode == "Keyboard/Mouse":
-            # REFINED: Robust Debounced Clicker
             fp1_ptp = np.ptp(clean_data[0, -100:]) 
             fp2_ptp = np.ptp(clean_data[1, -100:])
-            # current_amp = max(fp1_ptp, fp2_ptp)
-            
+
             current_time = time.time()
+
             status = "Ready"
             color = "gray"
-            
+
             # # Cooldown logic (0.5s) to prevent double firing
             # if (current_time - self.blink_cooldown) > 0.5:
             #     if current_amp > BLINK_THRESHOLD_UV:
@@ -343,25 +375,23 @@ class EEGApp:
             # else:
             #     status = "..." # In cooldown
             #     color = "#444444"
-
+            
             if max(fp1_ptp, fp2_ptp) > BLINK_THRESHOLD_UV:
                 status = "CLICK!"
                 color = "cyan"
-
 
             ax.text(0.5, 0.5, status, fontsize=30, ha='center', va='center', color=color, weight='bold')
             ax.axis('off')
             ax.set_title("Hands-Free Interface (Blink to Click)")
 
         elif self.current_mode == "Focus Tracker":
-            # REFINED: Uses smoothed focus ratio
             self.history["focus_ratio"] = np.roll(self.history["focus_ratio"], -1)
             self.history["focus_ratio"][-1] = focus
             
             ax.plot(self.history["focus_ratio"], color='cyan', lw=2)
             ax.set_ylim(0, 3)
             ax.set_xlim(0, self.history_len)
-            
+
             # Draw threshold zone
             ax.axhline(1.0, color='yellow', linestyle='--', label='Flow State')
             ax.fill_between(range(self.history_len), 1.0, 3.0, color='yellow', alpha=0.1)
@@ -372,12 +402,28 @@ class EEGApp:
         elif self.current_mode == "Ad Testing":
             self.history["asymmetry"] = np.roll(self.history["asymmetry"], -1)
             self.history["asymmetry"][-1] = asym
-            ax.plot(self.history["asymmetry"], color='magenta', lw=2)
+            
+            self.history["attention"] = np.roll(self.history["attention"], -1)
+            self.history["attention"][-1] = vis_attn
+
+            # Plot Valence (Magenta)
+            # If artifact is active, color the line Gray to indicate "Paused/Unreliable"
+            line_color = 'gray' if self.eog_artifact_active else 'magenta'
+            ax.plot(self.history["asymmetry"], color=line_color, lw=2, label="Valence (FAA)")
+            
+            # Plot Attention (Green) - Secondary axis scale roughly matches (-1 to 1 vs 0 to 2)
+            ax.plot((self.history["attention"] - 1.0), color='lime', lw=1, alpha=0.7, label="Visual Attention (Offset)")
+
             ax.axhline(0, color='white')
             ax.set_ylim(-1, 1)
             ax.set_xlim(0, self.history_len)
-            ax.fill_between(range(self.history_len), 0, self.history["asymmetry"], alpha=0.3, color='magenta')
-            ax.set_title("Emotional Valence (Asymmetry)")
+            
+            if not self.eog_artifact_active:
+                ax.fill_between(range(self.history_len), 0, self.history["asymmetry"], alpha=0.3, color='magenta')
+            
+            status = "VALID" if not self.eog_artifact_active else "EOG DETECTED (Holding)"
+            ax.set_title(f"Ad Response: {status}")
+            ax.legend(loc="upper left", fontsize="x-small")
 
         elif self.current_mode == "Driver Safety":
             # SCIENTIFIC APPROACH: Focus specifically on O1/O2 (Visual Cortex) for drowsiness detection
@@ -444,7 +490,6 @@ class EEGApp:
                     transform=ax.transAxes,
                     fontsize=12, color='red', ha='center', fontweight='bold',
                     bbox=dict(facecolor='black', alpha=0.8, edgecolor='red'))
-
 def main():
     app = EEGApp()
     eeg = acquisition.EEG(mode="roll")
@@ -460,7 +505,6 @@ def main():
             logging.info("Starting GUI Loop...")
             
             while True:
-                # Timed update
                 mne_chunk = eeg.get_mne(tim=UPDATE_INTERVAL_S)
                 
                 if mne_chunk is not None and len(mne_chunk) > 0:
