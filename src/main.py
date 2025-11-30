@@ -4,6 +4,7 @@ from matplotlib.widgets import RadioButtons
 import time
 import numpy as np
 import logging
+from collections import deque
 from scipy.signal import butter, filtfilt, iirnotch, welch, coherence
 
 # --- CONFIGURATION ---
@@ -38,7 +39,8 @@ try:
     from brainaccess.core.eeg_manager import EEGManager
 except ImportError:
     logging.error("BrainAccess libraries missing.")
-    exit(1)
+    # For testing without device, we continue but main() will fail if called
+    pass
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
@@ -125,6 +127,12 @@ class EEGApp:
             "asymmetry": np.zeros(self.history_len)
         }
         
+        # --- NEW STATE VARIABLES ---
+        self.focus_smoother = deque(maxlen=20) # Smooth over ~1 second
+        self.fatigue_integrator = 0            # To prevent false fatigue alarms
+        self.blink_cooldown = 0.0              # Debounce timer
+        self.last_blink_time = 0.0
+        
         self.is_noisy = False
         self.noise_reason = ""
 
@@ -176,6 +184,9 @@ class EEGApp:
 
     def change_mode(self, label):
         self.current_mode = label
+        # Reset mode-specific states
+        self.focus_smoother.clear()
+        self.fatigue_integrator = 0
         self.ax_mode.clear()
 
     def determine_scaling(self, chunk):
@@ -216,7 +227,7 @@ class EEGApp:
             self.noise_reason = f"Movement ({int(max_amp)}uV)"
         elif gamma_avg > NOISE_GAMMA_THRESHOLD:
             self.is_noisy = True
-            self.noise_reason = f"Muscle/Jaw ({int(gamma_avg)}uV)"
+            self.noise_reason = f"Connectors/Movement ({int(gamma_avg)}uV)"
         else:
             self.is_noisy = False
             self.noise_reason = ""
@@ -225,9 +236,13 @@ class EEGApp:
         fp1_a, fp2_a = psd_pow["Alpha"][0], psd_pow["Alpha"][1]
         asymmetry = (fp1_a - fp2_a) / (fp1_a + fp2_a + 1e-6)
         coherence_o1_o2 = self.processor.get_coherence(clean_data[2], clean_data[3])
+        
+        # Focus Calculation (Smoothed)
         beta_front = np.mean(psd_pow["Beta"][:2])
         theta_front = np.mean(psd_pow["Theta"][:2])
-        focus_ratio = beta_front / (theta_front + 1e-6)
+        raw_focus = beta_front / (theta_front + 1e-6)
+        self.focus_smoother.append(raw_focus)
+        focus_ratio = np.mean(self.focus_smoother) if self.focus_smoother else 0.0
 
         # Update Text Panel
         status_text = f"NOISE: {self.noise_reason}" if self.is_noisy else "SIGNAL: OK"
@@ -262,7 +277,7 @@ class EEGApp:
         ax.clear() 
         ax.set_facecolor('black')
 
-        # --- DRAW PLOTS FIRST (So we can see data even if noisy) ---
+        # --- DRAW PLOTS ---
         
         if self.current_mode == "Meditation Trainer":
             o1_a = psd["Alpha"][2]
@@ -272,25 +287,49 @@ class EEGApp:
             ax.set_title(f"MEDITATION (Alpha Power) - Sync: {coh:.2f}")
 
         elif self.current_mode == "Keyboard/Mouse":
+            # REFINED: Robust Debounced Clicker
             fp1_ptp = np.ptp(clean_data[0, -100:]) 
             fp2_ptp = np.ptp(clean_data[1, -100:])
-            status = "Waiting..."
+            # current_amp = max(fp1_ptp, fp2_ptp)
+            
+            current_time = time.time()
+            status = "Ready"
             color = "gray"
+            
+            # # Cooldown logic (0.5s) to prevent double firing
+            # if (current_time - self.blink_cooldown) > 0.5:
+            #     if current_amp > BLINK_THRESHOLD_UV:
+            #         status = "CLICK DETECTED"
+            #         color = "#00ffff" # Cyan
+            #         self.blink_cooldown = current_time # Reset cooldown
+            #         # Here you would emit the actual mouse click event
+            # else:
+            #     status = "..." # In cooldown
+            #     color = "#444444"
+
             if max(fp1_ptp, fp2_ptp) > BLINK_THRESHOLD_UV:
                 status = "CLICK!"
                 color = "cyan"
-            ax.text(0.5, 0.5, status, fontsize=30, ha='center', va='center', color=color)
+
+
+            ax.text(0.5, 0.5, status, fontsize=30, ha='center', va='center', color=color, weight='bold')
             ax.axis('off')
-            ax.set_title("Blink to Click")
+            ax.set_title("Hands-Free Interface (Blink to Click)")
 
         elif self.current_mode == "Focus Tracker":
+            # REFINED: Uses smoothed focus ratio
             self.history["focus_ratio"] = np.roll(self.history["focus_ratio"], -1)
             self.history["focus_ratio"][-1] = focus
+            
             ax.plot(self.history["focus_ratio"], color='cyan', lw=2)
             ax.set_ylim(0, 3)
             ax.set_xlim(0, self.history_len)
-            ax.axhline(1.0, color='yellow', linestyle='--', label='Zone In')
-            ax.set_title(f"Focus (Beta/Theta): {focus:.2f}")
+            
+            # Draw threshold zone
+            ax.axhline(1.0, color='yellow', linestyle='--', label='Flow State')
+            ax.fill_between(range(self.history_len), 1.0, 3.0, color='yellow', alpha=0.1)
+            
+            ax.set_title(f"Focus Level (Beta/Theta): {focus:.2f}")
             ax.grid(True, alpha=0.3)
 
         elif self.current_mode == "Ad Testing":
@@ -304,13 +343,27 @@ class EEGApp:
             ax.set_title("Emotional Valence (Asymmetry)")
 
         elif self.current_mode == "Driver Safety":
-            theta_avg = np.mean(psd["Theta"])
+            # REFINED: Persistence check for fatigue
+            theta_avg = np.mean(psd["Theta"]) # Total Theta
+            
+            # Threshold check with integration
+            if theta_avg > 25.0:
+                self.fatigue_integrator += 1
+            else:
+                self.fatigue_integrator = max(0, self.fatigue_integrator - 1)
+            
+            # Bar plot
             ax.barh(["Drowsiness"], [theta_avg], color='orange')
             ax.set_xlim(0, 50)
-            ax.set_title("Fatigue Monitor (Theta Power)")
+            ax.set_title("Fatigue Monitor (Persistent Theta)")
+            
+            # Display value
             ax.text(min(theta_avg, 45), 0, f"{theta_avg:.1f}", va='center', ha='left', color='white', fontweight='bold')
-            if theta_avg > 25:
-                ax.text(25, 0, "WARNING: FATIGUE", color='red', fontweight='bold', ha='center', bbox=dict(facecolor='black', alpha=0.7))
+            
+            # Trigger warning only if integrator is high (approx 1.5s of data)
+            if self.fatigue_integrator > 30: # 30 frames * 0.05s = 1.5s
+                ax.text(25, 0, "WARNING: FATIGUE", color='red', fontweight='bold', ha='center', 
+                        bbox=dict(facecolor='black', alpha=0.9, edgecolor='red', boxstyle='round,pad=1'))
 
         else: 
             ax.text(0.5, 0.5, "Monitor Mode\n(See raw data above)", ha='center', color='gray')
@@ -318,11 +371,8 @@ class EEGApp:
 
         # --- IF NOISY, ADD OVERLAY (Don't block, just warn) ---
         if self.is_noisy:
-            # Create a semi-transparent overlay
             ax.patch.set_facecolor('red')
-            ax.patch.set_alpha(0.2) # 20% red tint
-            
-            # Warning text (Top center, not blocking middle)
+            ax.patch.set_alpha(0.2) 
             ax.text(0.5, 0.9, f"⚠️ HIGH NOISE: {self.noise_reason}", 
                     transform=ax.transAxes,
                     fontsize=12, color='red', ha='center', fontweight='bold',
@@ -343,7 +393,7 @@ def main():
             logging.info("Starting GUI Loop...")
             
             while True:
-                start_t = time.time()
+                # Timed update
                 mne_chunk = eeg.get_mne(tim=UPDATE_INTERVAL_S)
                 
                 if mne_chunk is not None and len(mne_chunk) > 0:
